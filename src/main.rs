@@ -1,22 +1,118 @@
-use glob::Pattern;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, hash_map::DefaultHasher},
     env,
     fs::{self, File},
+    hash::{Hash, Hasher},
     io::{self, BufReader, BufWriter},
     path::{Path, PathBuf},
-    time::UNIX_EPOCH,
-    thread
+    time::{SystemTime, UNIX_EPOCH},
+    thread,
+    sync::Arc,
 };
+use glob::Pattern;
 use indicatif::{ProgressBar, ProgressStyle};
 use walkdir::WalkDir;
 use structopt::StructOpt;
 use bincode::{serialize_into, deserialize_from};
 use serde::{Serialize, Deserialize};
+use ctrlc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+fn main() -> io::Result<()> {
+    let opt = Opt::from_args();
+    
+    // Set up ctrl+c handler
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+    ctrlc::set_handler(move || {
+        r.store(false, Ordering::SeqCst);
+        println!("\nReceived Ctrl+C, finishing current operation...");
+    }).expect("Error setting Ctrl+C handler");
+
+    let mut manager = IndexManager::new(opt.verbose);
+    
+    // Initial indexing if needed
+    if opt.force_reindex || manager.index.chunks.is_empty() {
+        if opt.verbose {
+            println!("Building initial index...");
+        }
+        manager.index_home_directory()?;
+    }
+    
+    // Create progress bar for search
+    let spinner = if opt.verbose {
+        let sp = ProgressBar::new_spinner();
+        sp.set_style(
+            ProgressStyle::default_spinner()
+                .template("{spinner:.green} {wide_msg}")
+                .unwrap()
+        );
+        sp.set_message("Searching...");
+        Some(sp)
+    } else {
+        None
+    };
+
+    // Perform search
+    let results = manager.search(&opt.pattern)?;
+    
+    // Clear progress if verbose
+    if let Some(sp) = spinner {
+        sp.finish_and_clear();
+    }
+
+    // Handle no results case
+    if results.is_empty() {
+        if opt.verbose {
+            println!("No matches found for: {}", opt.pattern);
+        }
+        return Ok(());
+    }
+
+    // Sort results for consistent output
+    let mut sorted_results: Vec<_> = results.into_iter().collect();
+    sorted_results.sort();
+
+    // Print results with optional formatting
+    if opt.verbose {
+        println!("\nFound {} matches:", sorted_results.len());
+    }
+
+    for path in sorted_results {
+        if let Ok(metadata) = fs::metadata(&path) {
+            let file_type = if metadata.is_dir() { "DIR" } else { "FILE" };
+            let size = if metadata.is_file() {
+                humansize::format_size(metadata.len(), humansize::DECIMAL)
+            } else {
+                String::from("-")
+            };
+            
+            if opt.verbose {
+                println!("{:<5} {:>10} {}", file_type, size, path.display());
+            } else {
+                println!("{}", path.display());
+            }
+        } else {
+            // File might have been deleted since indexing
+            println!("{} (not accessible)", path.display());
+        }
+    }
+
+    // If background reindexing was triggered, wait for user input before exiting
+    if manager.is_reindexing() && opt.verbose {
+        println!("\nBackground reindexing in progress. Press Ctrl+C to exit...");
+        while running.load(Ordering::SeqCst) && manager.is_reindexing() {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    Ok(())
+}
 
 const CHUNK_SIZE: usize = 1000;
-const SAVE_INTERVAL: usize = 5000;
+const HASH_CACHE_DURATION: u64 = 3600; // 1 hour in seconds
 
+// CLI Options
 #[derive(StructOpt, Debug)]
 #[structopt(name = "rfind", about = "Fast home directory search tool")]
 struct Opt {
@@ -33,11 +129,24 @@ struct Opt {
     force_reindex: bool,
 }
 
+// File and Directory Structures
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct FileEntry {
     path: PathBuf,
     modified: u64,
     is_dir: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default)]
+struct DirectoryHash {
+    path: PathBuf,
+    hash: u64,
+    last_check: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default)]
+struct DirectoryHashes {
+    hashes: HashMap<PathBuf, DirectoryHash>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -53,18 +162,51 @@ struct Index {
     files_in_current_chunk: usize,
 }
 
-impl Index {
-    fn new() -> Self {
-        Self::load().unwrap_or_default()
+// Directory Hash Management
+impl DirectoryHashes {
+    fn load() -> Self {
+        if let Ok(home) = env::var("HOME") {
+            let hash_path = PathBuf::from(home).join(".rfind").join("dir_hashes.bin");
+            if let Ok(file) = File::open(hash_path) {
+                if let Ok(hashes) = deserialize_from(BufReader::new(file)) {
+                    return hashes;
+                }
+            }
+        }
+        Self::default()
     }
 
-    fn contains_file(&self, path: &Path) -> bool {
-        // Check current chunk
-        if self.current_chunk.files.contains_key(path) {
-            return true;
+    fn save(&self) -> io::Result<()> {
+        let home = env::var("HOME").map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let hash_dir = PathBuf::from(home).join(".rfind");
+        fs::create_dir_all(&hash_dir)?;
+        let hash_path = hash_dir.join("dir_hashes.bin");
+        let file = File::create(hash_path)?;
+        serialize_into(BufWriter::new(file), self)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+    }
+}
+
+// Index Management
+impl Index {
+    fn get_file_entry(&self, path: &Path) -> Option<&FileEntry> {
+        // First check current chunk
+        if let Some(entry) = self.current_chunk.files.get(path) {
+            return Some(entry);
         }
-        // Check all other chunks
-        self.chunks.iter().any(|chunk| chunk.files.contains_key(path))
+        
+        // Then check all other chunks
+        for chunk in &self.chunks {
+            if let Some(entry) = chunk.files.get(path) {
+                return Some(entry);
+            }
+        }
+        
+        None
+    }
+
+    fn new() -> Self {
+        Self::load().unwrap_or_default()
     }
 
     fn load() -> Option<Self> {
@@ -120,19 +262,114 @@ impl Index {
         Ok(())
     }
 
+    fn contains_file(&self, path: &Path) -> bool {
+        if self.current_chunk.files.contains_key(path) {
+            return true;
+        }
+        self.chunks.iter().any(|chunk| chunk.files.contains_key(path))
+    }
+
     fn extract_terms(path: &Path) -> Vec<String> {
-        path.to_string_lossy()
-            .to_lowercase()
-            .split([std::path::MAIN_SEPARATOR, '.', '_', '-', ' '])
+        let path_str = path.to_string_lossy().to_lowercase();
+        let filename = path.file_name()
+            .map(|f| f.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        
+        let mut terms = Vec::new();
+        
+        // Add the full filename as a term
+        if !filename.is_empty() {
+            terms.push(filename.clone());
+        }
+        
+        // Add path components
+        for component in path.components() {
+            if let std::path::Component::Normal(os_str) = component {
+                if let Some(s) = os_str.to_str() {
+                    terms.push(s.to_lowercase());
+                }
+            }
+        }
+        
+        // Split on common delimiters but preserve spaces
+        let split_terms: Vec<String> = path_str
+            .split(['.', '_', '-'])
             .filter(|s| !s.is_empty() && s.len() >= 2)
-            .map(String::from)
-            .collect()
+            .map(|s| s.trim().to_string())
+            .collect();
+            
+        terms.extend(split_terms);
+        
+        // Remove duplicates
+        terms.sort_unstable();
+        terms.dedup();
+        
+        terms
+    }
+
+    fn search_chunk(&self, chunk: &IndexChunk, search_terms: &[String], glob_pattern: &Pattern) -> HashSet<PathBuf> {
+        let mut results = HashSet::new();
+
+        // First, collect all paths that match the glob pattern
+        let glob_matches: HashSet<PathBuf> = chunk.files.keys()
+            .filter(|path| glob_pattern.matches(&path.to_string_lossy()))
+            .cloned()
+            .collect();
+
+        // If we're only doing a glob search (no search terms), return the glob matches
+        if search_terms.is_empty() {
+            return glob_matches;
+        }
+
+        // If we have both glob pattern and search terms, start with glob matches
+        results = glob_matches;
+
+        // Then filter by search terms
+        for term in search_terms {
+            let term_lower = term.to_lowercase();
+            results.retain(|path| {
+                let path_str = path.to_string_lossy().to_lowercase();
+                path_str.contains(&term_lower)
+            });
+        }
+
+        results
+    }
+
+    fn search(&self, pattern: &str) -> Vec<PathBuf> {
+        // Special case: if the pattern looks like a pure glob pattern, don't extract terms
+        let is_pure_glob = pattern.contains('*') || pattern.contains('?');
+        
+        let glob_pattern = if pattern.starts_with("**") {
+            Pattern::new(pattern).unwrap()
+        } else {
+            Pattern::new(&format!("**/{}", pattern)).unwrap()
+        };
+
+        let search_terms = if is_pure_glob {
+            Vec::new()  // Don't extract terms for pure glob patterns
+        } else {
+            Self::extract_terms(Path::new(pattern))
+        };
+
+        let mut results = HashSet::new();
+
+        // Search all chunks
+        for chunk in &self.chunks {
+            let chunk_results = self.search_chunk(chunk, &search_terms, &glob_pattern);
+            results.extend(chunk_results);
+        }
+
+        // Search current chunk
+        let current_results = self.search_chunk(&self.current_chunk, &search_terms, &glob_pattern);
+        results.extend(current_results);
+
+        results.into_iter().collect()
     }
 
     fn add_file(&mut self, entry: FileEntry) {
         let terms = Self::extract_terms(&entry.path);
 
-        // Add to current chunk
         for term in terms {
             self.current_chunk.terms
                 .entry(term)
@@ -143,7 +380,6 @@ impl Index {
         self.current_chunk.files.insert(entry.path.clone(), entry);
         self.files_in_current_chunk += 1;
 
-        // If chunk is full, move it to chunks list and create new chunk
         if self.files_in_current_chunk >= CHUNK_SIZE {
             let full_chunk = std::mem::replace(&mut self.current_chunk, IndexChunk::default());
             self.chunks.push(full_chunk);
@@ -151,97 +387,37 @@ impl Index {
         }
     }
 
-    fn search(&self, pattern: &str) -> Vec<PathBuf> {
-        let glob_pattern = if pattern.contains('*') {
-            Pattern::new(pattern).unwrap()
-        } else {
-            Pattern::new(&format!("**/{}", pattern)).unwrap()
-        };
-
-        let search_terms: Vec<String> = Self::extract_terms(Path::new(pattern));
-        let mut results = HashSet::new();
-
-        // Search in all chunks
-        for chunk in &self.chunks {
-            let chunk_results = self.search_chunk(chunk, &search_terms, &glob_pattern);
-            results.extend(chunk_results);
-        }
-
-        // Search in current chunk
-        let current_results = self.search_chunk(&self.current_chunk, &search_terms, &glob_pattern);
-        results.extend(current_results);
-
-        results.into_iter().collect()
-    }
-
-    fn search_chunk(&self, chunk: &IndexChunk, search_terms: &[String], glob_pattern: &Pattern) -> HashSet<PathBuf> {
-        let mut results = HashSet::new();
-
-        if search_terms.is_empty() {
-            // If no search terms, match only by glob pattern
-            results.extend(
-                chunk.files.keys()
-                    .filter(|path| glob_pattern.matches(&path.to_string_lossy()))
-                    .cloned()
-            );
-        } else {
-            // Start with the first term's matches
-            if let Some(first_term) = search_terms.first() {
-                if let Some(paths) = chunk.terms.get(first_term) {
-                    results = paths.clone();
-
-                    // Intersect with other terms
-                    for term in search_terms.iter().skip(1) {
-                        if let Some(paths) = chunk.terms.get(term) {
-                            results.retain(|path| paths.contains(path));
-                        } else {
-                            results.clear();
-                            break;
-                        }
-                    }
-
-                    // Apply glob pattern
-                    results.retain(|path| glob_pattern.matches(&path.to_string_lossy()));
-                }
-            }
-        }
-
-        results
-    }
 }
 
+// Index Manager
+#[derive(Debug)]
 struct IndexManager {
     index: Index,
     verbose: bool,
+    dir_hashes: DirectoryHashes,
+    reindexing: Arc<AtomicBool>, // Add this field
 }
 
 impl IndexManager {
-    fn filter_deleted_files(&self, paths: Vec<PathBuf>) -> (Vec<PathBuf>, bool) {
-        let mut valid_paths = Vec::new();
-        let mut found_deleted = false;
-        
-        for path in paths {
-            if path.exists() {
-                valid_paths.push(path);
-            } else {
-                found_deleted = true;
-                if self.verbose {
-                    println!("Detected deleted file: {}", path.display());
-                }
-            }
+    // Modify the new() function to initialize the reindexing field
+    fn new(verbose: bool) -> Self {
+        Self {
+            index: Index::new(),
+            verbose,
+            dir_hashes: DirectoryHashes::load(),
+            reindexing: Arc::new(AtomicBool::new(false)),
         }
-        
-        (valid_paths, found_deleted)
     }
 
-    fn background_reindex(&self) {
-        if self.verbose {
-            println!("Starting background re-index...");
-        }
+    // Add the is_reindexing method
+    fn is_reindexing(&self) -> bool {
+        self.reindexing.load(Ordering::SeqCst)
+    }
 
-        // Clone necessary data for background thread
-        let dirs = Self::get_user_directories();
-        let verbose = self.verbose;
+    // Modify the background_reindex method to use the reindexing flag
+    fn background_reindex(&self, verbose: bool, dirs: Vec<PathBuf>) {
+        let reindexing = self.reindexing.clone();
+        reindexing.store(true, Ordering::SeqCst);
 
         thread::spawn(move || {
             let mut manager = IndexManager::new(verbose);
@@ -259,14 +435,75 @@ impl IndexManager {
             if verbose {
                 println!("Background: Re-indexing complete");
             }
+
+            reindexing.store(false, Ordering::SeqCst);
         });
     }
 
-    fn new(verbose: bool) -> Self {
-        Self {
-            index: Index::new(),
-            verbose,
+    fn compute_directory_hash(dir: &Path) -> io::Result<u64> {
+        let mut hasher = DefaultHasher::new();
+        let mut entries = Vec::new();
+
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let metadata = entry.metadata()?;
+            let modified = metadata.modified()?.duration_since(UNIX_EPOCH).unwrap().as_secs();
+            
+            entry.file_name().to_string_lossy().hash(&mut hasher);
+            metadata.len().hash(&mut hasher);
+            modified.hash(&mut hasher);
+            
+            if metadata.is_dir() {
+                entries.push(entry.path());
+            }
         }
+
+        entries.sort();
+        
+        for subdir in entries {
+            if let Ok(hash) = Self::compute_directory_hash(&subdir) {
+                hash.hash(&mut hasher);
+            }
+        }
+
+        Ok(hasher.finish())
+    }
+
+    fn needs_reindex(&self, dir: &Path) -> io::Result<bool> {
+        let current_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        if let Some(dir_hash) = self.dir_hashes.hashes.get(dir) {
+            if current_time - dir_hash.last_check < HASH_CACHE_DURATION {
+                return Ok(false);
+            }
+        }
+
+        let new_hash = Self::compute_directory_hash(dir)?;
+        
+        Ok(match self.dir_hashes.hashes.get(dir) {
+            Some(dir_hash) => new_hash != dir_hash.hash,
+            None => true
+        })
+    }
+
+    fn update_directory_hash(&mut self, dir: &Path) -> io::Result<()> {
+        let current_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        let new_hash = Self::compute_directory_hash(dir)?;
+        
+        self.dir_hashes.hashes.insert(dir.to_path_buf(), DirectoryHash {
+            path: dir.to_path_buf(),
+            hash: new_hash,
+            last_check: current_time,
+        });
+        
+        self.dir_hashes.save()
     }
 
     fn index_directory(&mut self, dir: &Path) -> io::Result<()> {
@@ -274,10 +511,19 @@ impl IndexManager {
             return Ok(());
         }
 
-        if self.verbose {
-            println!("Indexing directory: {}", dir.display());
+        // Check if directory needs reindexing
+        if !self.needs_reindex(dir)? {
+            if self.verbose {
+                println!("Directory unchanged, skipping: {}", dir.display());
+            }
+            return Ok(());
         }
 
+        if self.verbose {
+            println!("Changes detected, indexing directory: {}", dir.display());
+        }
+
+        // Walk through directory and index files
         for entry in WalkDir::new(dir)
             .follow_links(true)
             .into_iter()
@@ -285,13 +531,27 @@ impl IndexManager {
         {
             let path = entry.path();
             
-            // Skip if already indexed
+            // Skip if already indexed and hash matches
             if self.index.contains_file(path) {
-                continue;
+                if let Ok(metadata) = entry.metadata() {
+                    let modified = metadata
+                        .modified()
+                        .unwrap_or(UNIX_EPOCH)
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+
+                    // Check if file has been modified since last index
+                    if let Some(existing) = self.index.get_file_entry(path) {
+                        if existing.modified == modified {
+                            continue;
+                        }
+                    }
+                }
             }
 
             if self.verbose {
-                println!("Indexing new file: {}", path.display());
+                println!("Indexing file: {}", path.display());
             }
 
             if let Ok(metadata) = entry.metadata() {
@@ -310,6 +570,8 @@ impl IndexManager {
             }
         }
 
+        // Update directory hash and save index
+        self.update_directory_hash(dir)?;
         self.index.save()?;
         Ok(())
     }
@@ -317,43 +579,30 @@ impl IndexManager {
     fn get_user_directories() -> Vec<PathBuf> {
         let mut dirs = Vec::new();
         
-        // Use the directories-next crate to get standard directories
-        if let Some(proj_dirs) = directories_next::ProjectDirs::from("com", "rfind", "rfind") {
-            if let Some(data_dir) = proj_dirs.data_local_dir().parent() {
-                // Include Trash/Recycle Bin
-                #[cfg(target_os = "windows")]
-                {
-                    if let Ok(recycler) = std::env::var("SystemDrive") {
-                        dirs.push(PathBuf::from(format!("{}\\$Recycle.Bin", recycler)));
-                    }
-                }
-                #[cfg(target_family = "unix")]
-                {
-                    dirs.push(data_dir.join(".local/share/Trash/files"));
-                }
-            }
-        }
-        
-        // Add user directories using the UserDirs API
         if let Some(user_dirs) = directories_next::UserDirs::new() {
-            // These are cross-platform and will resolve to the correct paths
-            if let Some(dir) = user_dirs.download_dir() { dirs.push(dir.to_path_buf()); }
-            if let Some(dir) = user_dirs.desktop_dir() { dirs.push(dir.to_path_buf()); }
-            if let Some(dir) = user_dirs.document_dir() { dirs.push(dir.to_path_buf()); }
-            if let Some(dir) = user_dirs.picture_dir() { dirs.push(dir.to_path_buf()); }
-            if let Some(dir) = user_dirs.audio_dir() { dirs.push(dir.to_path_buf()); }
-            if let Some(dir) = user_dirs.video_dir() { dirs.push(dir.to_path_buf()); }
-            if let Some(dir) = user_dirs.public_dir() { dirs.push(dir.to_path_buf()); }
-            if let Some(dir) = user_dirs.template_dir() { dirs.push(dir.to_path_buf()); }
-            // dirs.push(user_dirs.home_dir().to_path_buf());
+            // Add standard directories
+            let standard_dirs = [
+                user_dirs.download_dir(),
+                user_dirs.desktop_dir(),
+                user_dirs.document_dir(),
+                user_dirs.picture_dir(),
+                user_dirs.audio_dir(),
+                user_dirs.video_dir(),
+                user_dirs.public_dir(),
+                user_dirs.template_dir(),
+            ];
 
-            // Add iCloud directory if on macOS
+            for dir in standard_dirs.iter().filter_map(|d| *d) {
+                dirs.push(dir.to_path_buf());
+            }
+
+            // Platform specific directories
             #[cfg(target_os = "macos")]
             if let Some(home) = user_dirs.home_dir().to_str() {
+                // Add iCloud directories
                 let icloud_dir = PathBuf::from(format!("{}/Library/Mobile Documents", home));
                 if icloud_dir.exists() {
                     dirs.push(icloud_dir.clone());
-                    // Add all immediate subdirectories
                     if let Ok(entries) = fs::read_dir(&icloud_dir) {
                         for entry in entries.filter_map(|e| e.ok()) {
                             if let Ok(metadata) = entry.metadata() {
@@ -365,7 +614,13 @@ impl IndexManager {
                     }
                 }
             }
+
+            #[cfg(target_os = "windows")]
+            if let Ok(onedrive) = env::var("OneDriveConsumer") {
+                dirs.push(PathBuf::from(onedrive));
+            }
         }
+        
         dirs
     }
 
@@ -377,52 +632,30 @@ impl IndexManager {
         let progress = ProgressBar::new_spinner();
         progress.set_style(spinner_style);
         
-        let mut file_count = 0;
+        let dirs = Self::get_user_directories();
+        let total_dirs = dirs.len();
+        let mut indexed_dirs = 0;
 
-        for dir in Self::get_user_directories() {
+        for dir in dirs {
             if !dir.exists() {
                 continue;
             }
 
             if self.verbose {
-                progress.set_message(format!("Indexing directory: {}", dir.display()));
+                progress.set_message(format!(
+                    "Indexing directory ({}/{}): {}", 
+                    indexed_dirs + 1, 
+                    total_dirs, 
+                    dir.display()
+                ));
             }
 
-            for entry in WalkDir::new(&dir)
-                .follow_links(true)
-                .into_iter()
-                .filter_map(|e| e.ok())
-        {
-            let path = entry.path();
-            
-            if self.verbose {
-                progress.set_message(format!("Indexing: {}", path.display()));
-            }
-
-            if let Ok(metadata) = entry.metadata() {
-                let modified = metadata
-                    .modified()
-                    .unwrap_or(UNIX_EPOCH)
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs();
-
-                self.index.add_file(FileEntry {
-                    path: path.to_path_buf(),
-                    modified,
-                    is_dir: metadata.is_dir(),
-                });
-
-                file_count += 1;
-                if file_count % SAVE_INTERVAL == 0 {
-                    self.index.save()?;
-                }
-            }
+            self.index_directory(&dir)?;
+            indexed_dirs += 1;
         }
-    }
 
         if self.verbose {
-            progress.finish_with_message(format!("Indexed {} files", file_count));
+            progress.finish_with_message(format!("Indexed {} directories", indexed_dirs));
         }
 
         self.index.save()?;
@@ -430,69 +663,158 @@ impl IndexManager {
     }
 
     fn search(&mut self, pattern: &str) -> io::Result<Vec<PathBuf>> {
+        let timer = std::time::Instant::now();
+        
         // First try searching with current index
         let mut results = self.index.search(pattern);
-
-        // Check for deleted files first
-        let (valid_results, found_deleted) = self.filter_deleted_files(results);
-
-        // If deleted files found, trigger background reindex
-        if found_deleted {
-            if self.verbose {
-                println!("Deleted files detected, triggering background re-index");
+        
+        // Check for deleted files and modified files
+        let mut needs_reindex = false;
+        let mut valid_results = Vec::new();
+        
+        for path in results {
+            match fs::metadata(&path) {
+                Ok(metadata) => {
+                    // Check if file has been modified since indexing
+                    let current_modified = metadata
+                        .modified()
+                        .unwrap_or(UNIX_EPOCH)
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+                        
+                    if let Some(entry) = self.index.get_file_entry(&path) {
+                        if entry.modified == current_modified {
+                            valid_results.push(path);
+                            continue;
+                        }
+                    }
+                    
+                    needs_reindex = true;
+                    // Still include the file in results even if modified
+                    valid_results.push(path);
+                }
+                Err(_) => {
+                    // File no longer exists
+                    needs_reindex = true;
+                }
             }
-            self.background_reindex();
         }
 
-        // If no valid results found, do a lazy re-index of all directories
+        // If we found deleted/modified files, trigger background reindex
+        if needs_reindex {
+            if self.verbose {
+                println!("Changes detected, triggering background re-index");
+            }
+            self.background_reindex(self.verbose, Self::get_user_directories());
+        }
+
+        // If no valid results found, do an immediate lazy re-index
         if valid_results.is_empty() {
             if self.verbose {
                 println!("No results found, performing lazy re-index...");
             }
 
-            for dir in Self::get_user_directories() {
-                self.index_directory(&dir)?;
+            // First check recently modified directories
+            let recent_dirs = self.get_recently_modified_directories();
+            for dir in recent_dirs {
+                if let Err(e) = self.index_directory(&dir) {
+                    eprintln!("Error indexing directory {}: {}", dir.display(), e);
+                }
             }
 
-            // Search again after re-indexing
+            // Search again after indexing recent directories
             results = self.index.search(pattern);
-            // Check again for deleted files
-            let (reindexed_results, found_deleted) = self.filter_deleted_files(results);
-            
-            // If deleted files found after reindex, trigger background refresh
-            if found_deleted {
-                self.background_reindex();
+            if !results.is_empty() {
+                valid_results = results.into_iter()
+                    .filter(|path| path.exists())
+                    .collect();
             }
-            
-            return Ok(reindexed_results);
+
+            // If still no results, do a full reindex
+            if valid_results.is_empty() {
+                for dir in Self::get_user_directories() {
+                    if let Err(e) = self.index_directory(&dir) {
+                        eprintln!("Error indexing directory {}: {}", dir.display(), e);
+                    }
+                }
+
+                // Final search after full reindex
+                results = self.index.search(pattern);
+                valid_results = results.into_iter()
+                    .filter(|path| path.exists())
+                    .collect();
+            }
+        }
+
+        // Sort results by relevance and recency
+        valid_results.sort_by(|a, b| {
+            let a_score = self.compute_result_score(a);
+            let b_score = self.compute_result_score(b);
+            b_score.partial_cmp(&a_score).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        if self.verbose {
+            println!("Search completed in {:?}", timer.elapsed());
         }
 
         Ok(valid_results)
     }
-}
 
-fn main() -> io::Result<()> {
-    let opt = Opt::from_args();
-    
-    let mut manager = IndexManager::new(opt.verbose);
-    
-    // Only do initial indexing if forced or no index exists
-    if opt.force_reindex || manager.index.chunks.is_empty() {
-        if opt.verbose {
-            println!("Building initial index...");
+    fn get_recently_modified_directories(&self) -> Vec<PathBuf> {
+        let mut recent_dirs = Vec::new();
+        let current_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        for (path, hash) in &self.dir_hashes.hashes {
+            if current_time - hash.last_check < 3600 * 24 { // Check dirs modified in last 24 hours
+                recent_dirs.push(path.clone());
+            }
         }
-        manager.index_home_directory()?;
+
+        recent_dirs
     }
-    
-    let results = manager.search(&opt.pattern)?;
-    
-    if results.is_empty() && opt.verbose {
-        println!("No matches found for: {}", opt.pattern);
+
+    fn compute_result_score(&self, path: &Path) -> f64 {
+        let mut score = 1.0;
+
+        // Boost score based on recency
+        if let Ok(metadata) = fs::metadata(path) {
+            if let Ok(modified) = metadata.modified() {
+                if let Ok(duration) = modified.duration_since(UNIX_EPOCH) {
+                    let age_hours = (SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs() - duration.as_secs()) as f64 / 3600.0;
+                    
+                    // Exponential decay based on age
+                    score *= (-age_hours / 720.0).exp(); // Half-life of 30 days
+                }
+            }
+        }
+
+        // Boost score for files in user's primary directories
+        if let Some(user_dirs) = directories_next::UserDirs::new() {
+            let important_dirs = [
+                user_dirs.download_dir(),
+                user_dirs.desktop_dir(),
+                user_dirs.document_dir(),
+            ];
+
+            for dir in important_dirs.iter().filter_map(|d| *d) {
+                if path.starts_with(dir) {
+                    score *= 1.5;
+                    break;
+                }
+            }
+        }
+
+        // Penalty for deeply nested files
+        let depth = path.components().count() as f64;
+        score *= 1.0 / (depth * 0.1 + 1.0);
+
+        score
     }
-    
-    for path in results {
-        println!("{}", path.display());
-    }
-    
-    Ok(())
 }
