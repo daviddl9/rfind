@@ -271,18 +271,15 @@ impl Index {
 
     fn extract_terms(path: &Path) -> Vec<String> {
         let path_str = path.to_string_lossy().to_lowercase();
-        let filename = path.file_name()
-            .map(|f| f.to_string_lossy().to_lowercase())
-            .unwrap_or_default();
         
         let mut terms = Vec::new();
         
-        // Add the full filename as a term
-        if !filename.is_empty() {
-            terms.push(filename.clone());
+        // Add complete filename as a term
+        if let Some(filename) = path.file_name() {
+            terms.push(filename.to_string_lossy().to_lowercase());
         }
         
-        // Add path components
+        // Add individual path components
         for component in path.components() {
             if let std::path::Component::Normal(os_str) = component {
                 if let Some(s) = os_str.to_str() {
@@ -291,16 +288,36 @@ impl Index {
             }
         }
         
-        // Split on common delimiters but preserve spaces
+        // Add terms split by common delimiters
         let split_terms: Vec<String> = path_str
-            .split(['.', '_', '-'])
-            .filter(|s| !s.is_empty() && s.len() >= 2)
-            .map(|s| s.trim().to_string())
+            .split(['.', '_', '-', '[', ']', '(', ')', '{', '}'])
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .flat_map(|s| {
+                // For each split part, also include its space-separated components
+                let mut parts = vec![s.to_string()];
+                parts.extend(
+                    s.split_whitespace()
+                        .filter(|w| w.len() >= 2)
+                        .map(|w| w.to_string())
+                );
+                parts
+            })
             .collect();
             
         terms.extend(split_terms);
         
-        // Remove duplicates
+        // Add substrings for partial matching
+        let clean_path = path_str
+            .replace(['[', ']', '(', ')', '{', '}'], "")
+            .replace(|c: char| !c.is_alphanumeric() && !c.is_whitespace(), " ")
+            .trim()
+            .to_string();
+            
+        terms.push(clean_path);
+        
+        // Remove duplicates and empty terms
+        terms.retain(|s| !s.is_empty());
         terms.sort_unstable();
         terms.dedup();
         
@@ -308,48 +325,77 @@ impl Index {
     }
 
     fn search_chunk(&self, chunk: &IndexChunk, search_terms: &[String], glob_pattern: &Pattern) -> HashSet<PathBuf> {
-        let mut results = HashSet::new();
-
-        // First, collect all paths that match the glob pattern
+        // First handle glob pattern matching
         let glob_matches: HashSet<PathBuf> = chunk.files.keys()
             .filter(|path| glob_pattern.matches(&path.to_string_lossy()))
             .cloned()
             .collect();
 
-        // If we're only doing a glob search (no search terms), return the glob matches
+        // If no search terms (pure glob search), return glob matches
         if search_terms.is_empty() {
             return glob_matches;
         }
 
-        // If we have both glob pattern and search terms, start with glob matches
-        results = glob_matches;
+        // If we have both glob pattern and search terms
+        let mut results = if glob_pattern.as_str() == "**/*" {
+            // If using default glob pattern, start with all files
+            chunk.files.keys().cloned().collect()
+        } else {
+            // Otherwise start with glob matches
+            glob_matches
+        };
 
-        // Then filter by search terms
-        for term in search_terms {
-            let term_lower = term.to_lowercase();
-            results.retain(|path| {
-                let path_str = path.to_string_lossy().to_lowercase();
+        // Convert search pattern to lowercase for case-insensitive matching
+        let first_term = search_terms[0].to_lowercase();
+        
+        // Filter results that contain all search terms
+        results.retain(|path| {
+            let path_str = path.to_string_lossy().to_lowercase();
+            
+            // Try exact filename match first
+            if let Some(filename) = path.file_name() {
+                let filename_lower = filename.to_string_lossy().to_lowercase();
+                if filename_lower.contains(&first_term) {
+                    return search_terms.iter().skip(1).all(|term| {
+                        path_str.contains(&term.to_lowercase())
+                    });
+                }
+            }
+            
+            // Fall back to full path search
+            search_terms.iter().all(|term| {
+                let term_lower = term.to_lowercase();
                 path_str.contains(&term_lower)
-            });
-        }
+            })
+        });
 
         results
     }
 
     fn search(&self, pattern: &str) -> Vec<PathBuf> {
-        // Special case: if the pattern looks like a pure glob pattern, don't extract terms
+        // Determine if this is a glob pattern
         let is_pure_glob = pattern.contains('*') || pattern.contains('?');
         
         let glob_pattern = if pattern.starts_with("**") {
             Pattern::new(pattern).unwrap()
-        } else {
+        } else if is_pure_glob {
             Pattern::new(&format!("**/{}", pattern)).unwrap()
+        } else {
+            Pattern::new("**/*").unwrap()  // Default pattern for non-glob searches
         };
 
         let search_terms = if is_pure_glob {
             Vec::new()  // Don't extract terms for pure glob patterns
         } else {
-            Self::extract_terms(Path::new(pattern))
+            // For non-glob searches, clean up the pattern first
+            let cleaned_pattern = pattern.to_lowercase()
+                .replace(['[', ']', '(', ')', '{', '}'], " ")
+                .replace(|c: char| !c.is_alphanumeric() && !c.is_whitespace(), " ");
+                
+            cleaned_pattern.split_whitespace()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect()
         };
 
         let mut results = HashSet::new();
