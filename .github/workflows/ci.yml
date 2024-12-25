@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build_and_test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build (Release)
+        run: cargo build --release --verbose
+
+      - name: Run Tests
+        run: cargo test --release --verbose
+
+      # The "if-no-files-found: ignore" means it'll skip missing files
+      - name: Upload rfind binary
+        uses: actions/upload-artifact@v3
+        with:
+          name: "rfind-${{ matrix.os }}"
+          path: |
+            target/release/rfind
+            target\release\rfind.exe
+          if-no-files-found: ignore
