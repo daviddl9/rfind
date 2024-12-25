@@ -18,7 +18,6 @@ use serde::{Serialize, Deserialize};
 use bincode::{serialize_into, deserialize_from};
 use strsim::{jaro_winkler, normalized_levenshtein};
 use directories_next;
-use humansize;
 
 // --------------------------------------------------
 // Constants, Structs, and Shared Utilities
@@ -77,9 +76,9 @@ pub struct Index {
 // --------------------------------------------------
 impl DirectoryHashes {
     pub fn load() -> Self {
-        if let Ok(home) = env::var("HOME") {
-            let hash_path = PathBuf::from(&home).join(".rfind").join("dir_hashes.bin");
-            if let Ok(file) = File::open(&hash_path) {
+        if let Ok(rfind_dir) = get_rfind_dir() {
+            let hash_path = rfind_dir.join("dir_hashes.bin");
+            if let Ok(file) = File::open(hash_path) {
                 if let Ok(hashes) = deserialize_from(BufReader::new(file)) {
                     return hashes;
                 }
@@ -87,16 +86,15 @@ impl DirectoryHashes {
         }
         Self::default()
     }
-
+    
     pub fn save(&self) -> io::Result<()> {
-        let home = env::var("HOME").map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        let hash_dir = PathBuf::from(&home).join(".rfind");
-        fs::create_dir_all(&hash_dir)?;
-        let hash_path = hash_dir.join("dir_hashes.bin");
+        let rfind_dir = get_rfind_dir()?;
+        fs::create_dir_all(&rfind_dir)?;
+        let hash_path = rfind_dir.join("dir_hashes.bin");
         let file = File::create(hash_path)?;
         serialize_into(BufWriter::new(file), self)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
-    }
+    }   
 }
 
 // --------------------------------------------------
@@ -374,6 +372,17 @@ impl Index {
         }
     }
 }
+
+fn get_rfind_dir() -> io::Result<PathBuf> {
+    if let Some(base_dirs) = directories_next::BaseDirs::new() {
+        // E.g. store indexing data in ~/.rfind or an OS-appropriate location
+        Ok(base_dirs.home_dir().join(".rfind"))
+    } else {
+        // If there's truly no home directory, bail out
+        Err(io::Error::new(io::ErrorKind::Other, "No home directory found."))
+    }
+}
+
 
 // --------------------------------------------------
 // IndexManager
