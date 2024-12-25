@@ -1,6 +1,5 @@
 use std::{
     collections::{HashMap, HashSet, hash_map::DefaultHasher},
-    env,
     fs::{self, File},
     hash::{Hash, Hasher},
     io::{self, BufReader, BufWriter},
@@ -138,8 +137,13 @@ impl Index {
 
     /// Save the current index to disk
     pub fn save(&self) -> io::Result<()> {
-        let home = env::var("HOME").map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        let index_dir = PathBuf::from(&home).join(".rfind");
+        // Obtain a cross-platform home directory using directories_next
+        let base_dirs = BaseDirs::new().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Other, "Could not determine home directory")
+        })?;
+        
+        // Create ~/.rfind (or the Windows equivalent)
+        let index_dir = base_dirs.home_dir().join(".rfind");
         fs::create_dir_all(&index_dir)?;
 
         // Save older chunks
