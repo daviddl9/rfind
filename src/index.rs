@@ -18,6 +18,8 @@ use bincode::{serialize_into, deserialize_from};
 use strsim::{jaro_winkler, normalized_levenshtein};
 use directories_next;
 use directories_next::BaseDirs;
+#[cfg(target_os = "windows")]
+use std::env;
 
 // --------------------------------------------------
 // Constants, Structs, and Shared Utilities
