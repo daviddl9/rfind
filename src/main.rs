@@ -17,6 +17,23 @@ use bincode::{serialize_into, deserialize_from};
 use serde::{Serialize, Deserialize};
 use ctrlc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use strsim::{jaro_winkler, normalized_levenshtein};
+
+// Add this constant near the top of the file
+const FUZZY_THRESHOLD: f64 = 0.8;  // Minimum similarity score to consider a match
+
+// Add these new structs for search results
+#[derive(Debug, Clone)]
+struct SearchResult {
+    path: PathBuf,
+    score: f64,
+}
+
+impl SearchResult {
+    fn new(path: PathBuf, score: f64) -> Self {
+        Self { path, score }
+    }
+}
 
 fn main() -> io::Result<()> {
     let opt = Opt::from_args();
@@ -189,6 +206,127 @@ impl DirectoryHashes {
 
 // Index Management
 impl Index {
+    fn fuzzy_match(haystack: &str, needle: &str) -> Option<f64> {
+        let haystack = haystack.to_lowercase();
+        let needle = needle.to_lowercase();
+        
+        // Direct substring match gets highest score
+        if haystack.contains(&needle) {
+            return Some(1.0);
+        }
+        
+        // Check individual components for fuzzy matches
+        let haystack_parts: Vec<&str> = haystack
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|s| !s.is_empty())
+            .collect();
+            
+        let mut max_score: f64 = 0.0;
+        
+        for part in haystack_parts {
+            // Use Jaro-Winkler for shorter strings (better for typos)
+            // Use normalized Levenshtein for longer strings (better for partial matches)
+            let score = if needle.len() <= 5 {
+                jaro_winkler(part, &needle)
+            } else {
+                normalized_levenshtein(part, &needle)
+            };
+            
+            max_score = max_score.max(score);
+        }
+        
+        if max_score >= FUZZY_THRESHOLD {
+            Some(max_score)
+        } else {
+            None
+        }
+    }
+
+    fn search_chunk_fuzzy(&self, chunk: &IndexChunk, search_terms: &[String], glob_pattern: &Pattern) -> Vec<SearchResult> {
+        let mut results = Vec::new();
+        
+        for (path, _) in &chunk.files {
+            // First check glob pattern if it's not the default pattern
+            if glob_pattern.as_str() != "**/*" && !glob_pattern.matches(&path.to_string_lossy()) {
+                continue;
+            }
+            
+            let path_str = path.to_string_lossy();
+            let filename = path.file_name()
+                .map(|f| f.to_string_lossy())
+                .unwrap_or_default();
+                
+            let mut min_score: f64 = 1.0;
+            let mut found_all_terms = true;
+            
+            // Calculate fuzzy match scores for each search term
+            for term in search_terms {
+                if let Some(filename_score) = Self::fuzzy_match(&filename, term) {
+                    min_score = min_score.min(filename_score);
+                } else if let Some(path_score) = Self::fuzzy_match(&path_str, term) {
+                    min_score = min_score.min(path_score);
+                } else {
+                    found_all_terms = false;
+                    break;
+                }
+            }
+            
+            if found_all_terms {
+                results.push(SearchResult::new(path.clone(), min_score));
+            }
+        }
+        
+        results
+    }
+
+    // Modify the main search function to use fuzzy matching
+    fn search(&self, pattern: &str) -> Vec<PathBuf> {
+        // Determine if this is a glob pattern
+        let is_pure_glob = pattern.contains('*') || pattern.contains('?');
+        
+        let glob_pattern = if pattern.starts_with("**") {
+            Pattern::new(pattern).unwrap()
+        } else if is_pure_glob {
+            Pattern::new(&format!("**/{}", pattern)).unwrap()
+        } else {
+            Pattern::new("**/*").unwrap()  // Default pattern for non-glob searches
+        };
+
+        let search_terms = if is_pure_glob {
+            Vec::new()  // Don't extract terms for pure glob patterns
+        } else {
+            // For non-glob searches, split the pattern into terms
+            pattern.split_whitespace()
+                .map(|s| s.to_string())
+                .collect()
+        };
+
+        let mut all_results = Vec::new();
+
+        // Search all chunks with fuzzy matching
+        for chunk in &self.chunks {
+            let chunk_results = self.search_chunk_fuzzy(chunk, &search_terms, &glob_pattern);
+            all_results.extend(chunk_results);
+        }
+
+        // Search current chunk with fuzzy matching
+        let current_results = self.search_chunk_fuzzy(&self.current_chunk, &search_terms, &glob_pattern);
+        all_results.extend(current_results);
+
+        // Sort results by score (highest first) and deduplicate
+        all_results.sort_by(|a, b| {
+            b.score.partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        
+        // Convert to paths, maintaining order but removing duplicates
+        let mut seen = HashSet::new();
+        all_results.into_iter()
+            .filter(|r| seen.insert(r.path.clone()))
+            .map(|r| r.path)
+            .collect()
+    }
+
     fn get_file_entry(&self, path: &Path) -> Option<&FileEntry> {
         // First check current chunk
         if let Some(entry) = self.current_chunk.files.get(path) {
@@ -322,95 +460,6 @@ impl Index {
         terms.dedup();
         
         terms
-    }
-
-    fn search_chunk(&self, chunk: &IndexChunk, search_terms: &[String], glob_pattern: &Pattern) -> HashSet<PathBuf> {
-        // First handle glob pattern matching
-        let glob_matches: HashSet<PathBuf> = chunk.files.keys()
-            .filter(|path| glob_pattern.matches(&path.to_string_lossy()))
-            .cloned()
-            .collect();
-
-        // If no search terms (pure glob search), return glob matches
-        if search_terms.is_empty() {
-            return glob_matches;
-        }
-
-        // If we have both glob pattern and search terms
-        let mut results = if glob_pattern.as_str() == "**/*" {
-            // If using default glob pattern, start with all files
-            chunk.files.keys().cloned().collect()
-        } else {
-            // Otherwise start with glob matches
-            glob_matches
-        };
-
-        // Convert search pattern to lowercase for case-insensitive matching
-        let first_term = search_terms[0].to_lowercase();
-        
-        // Filter results that contain all search terms
-        results.retain(|path| {
-            let path_str = path.to_string_lossy().to_lowercase();
-            
-            // Try exact filename match first
-            if let Some(filename) = path.file_name() {
-                let filename_lower = filename.to_string_lossy().to_lowercase();
-                if filename_lower.contains(&first_term) {
-                    return search_terms.iter().skip(1).all(|term| {
-                        path_str.contains(&term.to_lowercase())
-                    });
-                }
-            }
-            
-            // Fall back to full path search
-            search_terms.iter().all(|term| {
-                let term_lower = term.to_lowercase();
-                path_str.contains(&term_lower)
-            })
-        });
-
-        results
-    }
-
-    fn search(&self, pattern: &str) -> Vec<PathBuf> {
-        // Determine if this is a glob pattern
-        let is_pure_glob = pattern.contains('*') || pattern.contains('?');
-        
-        let glob_pattern = if pattern.starts_with("**") {
-            Pattern::new(pattern).unwrap()
-        } else if is_pure_glob {
-            Pattern::new(&format!("**/{}", pattern)).unwrap()
-        } else {
-            Pattern::new("**/*").unwrap()  // Default pattern for non-glob searches
-        };
-
-        let search_terms = if is_pure_glob {
-            Vec::new()  // Don't extract terms for pure glob patterns
-        } else {
-            // For non-glob searches, clean up the pattern first
-            let cleaned_pattern = pattern.to_lowercase()
-                .replace(['[', ']', '(', ')', '{', '}'], " ")
-                .replace(|c: char| !c.is_alphanumeric() && !c.is_whitespace(), " ");
-                
-            cleaned_pattern.split_whitespace()
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
-                .collect()
-        };
-
-        let mut results = HashSet::new();
-
-        // Search all chunks
-        for chunk in &self.chunks {
-            let chunk_results = self.search_chunk(chunk, &search_terms, &glob_pattern);
-            results.extend(chunk_results);
-        }
-
-        // Search current chunk
-        let current_results = self.search_chunk(&self.current_chunk, &search_terms, &glob_pattern);
-        results.extend(current_results);
-
-        results.into_iter().collect()
     }
 
     fn add_file(&mut self, entry: FileEntry) {
@@ -642,6 +691,33 @@ impl IndexManager {
                 dirs.push(dir.to_path_buf());
             }
 
+            // Add application directory
+            if let Some(home) = user_dirs.home_dir().to_str() {
+                #[cfg(target_os = "macos")]
+                {
+                    let app_dir = PathBuf::from(format!("{}/Applications", home));
+                    if app_dir.exists() {
+                        dirs.push(app_dir);
+                    }
+                }
+
+                #[cfg(target_os = "linux")]
+                {
+                    let app_dir = PathBuf::from(format!("{}/.local/share/applications", home));
+                    if app_dir.exists() {
+                        dirs.push(app_dir);
+                    }
+                }
+
+                #[cfg(target_os = "windows")]
+                {
+                    let app_dir = PathBuf::from(format!("{}\\AppData\\Local\\Programs", home));
+                    if app_dir.exists() {
+                        dirs.push(app_dir);
+                    }
+                }
+            }
+
             // Platform specific directories
             #[cfg(target_os = "macos")]
             if let Some(home) = user_dirs.home_dir().to_str() {
@@ -721,7 +797,6 @@ impl IndexManager {
         for path in results {
             match fs::metadata(&path) {
                 Ok(metadata) => {
-                    // Check if file has been modified since indexing
                     let current_modified = metadata
                         .modified()
                         .unwrap_or(UNIX_EPOCH)
@@ -737,11 +812,9 @@ impl IndexManager {
                     }
                     
                     needs_reindex = true;
-                    // Still include the file in results even if modified
                     valid_results.push(path);
                 }
                 Err(_) => {
-                    // File no longer exists
                     needs_reindex = true;
                 }
             }
