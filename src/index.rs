@@ -18,6 +18,7 @@ use serde::{Serialize, Deserialize};
 use bincode::{serialize_into, deserialize_from};
 use strsim::{jaro_winkler, normalized_levenshtein};
 use directories_next;
+use directories_next::BaseDirs;
 
 // --------------------------------------------------
 // Constants, Structs, and Shared Utilities
@@ -103,8 +104,12 @@ impl DirectoryHashes {
 impl Index {
     /// Load an existing index from disk if possible
     pub fn load() -> Option<Self> {
-        let home = env::var("HOME").ok()?;
-        let index_dir = PathBuf::from(&home).join(".rfind");
+        // Try to get a BaseDirs instance (home directory, cache directory, etc.)
+        let base_dirs = BaseDirs::new()?;
+
+        // Use home_dir() + ".rfind" => ~/.rfind on Unix, 
+        // C:\Users\<user>\.rfind on Windows, etc.
+        let index_dir = base_dirs.home_dir().join(".rfind");
         fs::create_dir_all(&index_dir).ok()?;
 
         let mut chunks = Vec::new();
