@@ -1,4 +1,5 @@
 # rfind
+[![CI](https://github.com/daviddl9/rfind/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/daviddl9/rfind/actions/workflows/ci.yml)
 
 **rfind** is a **supercharged** alternative to the classic [\*nix `find`](https://man7.org/linux/man-pages/man1/find.1.html) command. It focuses on **speed**, **fuzzy matching**, and **smart caching** (via indexing). **rfind** accelerates searches by building and maintaining a local index for your most-used directories.
 
