@@ -1,0 +1,36 @@
+timestamp,pattern,search_dir,find_time,rfind_time,speedup
+2024-12-26 23:58:09,*.log,/usr,Running find benchmark...
+------------------------
+Run 1:
+  Time taken: s
+------------------------
+Run 2:
+  Time taken: s
+------------------------
+Run 3:
+  Time taken: s
+------------------------
+Run 4:
+  Time taken: s
+------------------------
+Run 5:
+  Time taken: s
+------------------------
+Average time for find: s,Running rfind benchmark...
+------------------------
+Run 1:
+  Time taken: s
+------------------------
+Run 2:
+  Time taken: s
+------------------------
+Run 3:
+  Time taken: s
+------------------------
+Run 4:
+  Time taken: s
+------------------------
+Run 5:
+  Time taken: s
+------------------------
+Average time for rfind: s,

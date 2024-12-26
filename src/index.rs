@@ -1,11 +1,10 @@
 use std::{
-    collections::{HashMap, HashSet, hash_map::DefaultHasher},
+    collections::{hash_map::DefaultHasher, HashMap, HashSet},
     fs::{self, File},
     hash::{Hash, Hasher},
     io::{self, BufReader, BufWriter},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
-    sync::Arc,
+    sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex},
     thread,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -48,11 +47,12 @@ pub struct FileEntry {
     pub is_dir: bool,
 }
 
-#[derive(Serialize, Deserialize, Debug, Default)]
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct DirectoryHash {
     pub path: PathBuf,
     pub hash: u64,
     pub last_check: u64,
+    pub known_files: HashSet<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -60,13 +60,13 @@ pub struct DirectoryHashes {
     pub hashes: HashMap<PathBuf, DirectoryHash>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct IndexChunk {
     pub files: HashMap<PathBuf, FileEntry>,
     pub terms: HashMap<String, HashSet<PathBuf>>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Index {
     pub chunks: Vec<IndexChunk>,
     pub current_chunk: IndexChunk,
@@ -539,12 +539,16 @@ impl IndexManager {
 
     pub fn search(&mut self, pattern: &str) -> io::Result<Vec<PathBuf>> {
         let timer = std::time::Instant::now();
-        let mut results = self.index.search(pattern);
-
-        let mut needs_reindex = false;
+        let initial_results = self.index.search(pattern);
+        
+        // Track changes for incremental updates
+        let mut added_files = Vec::new();
+        let mut removed_files = Vec::new();
+        let mut modified_files = Vec::new();
         let mut valid_results = Vec::new();
-
-        for path in &results {
+        
+        // Check each result and build change sets
+        for path in &initial_results {
             match fs::metadata(path) {
                 Ok(metadata) => {
                     let current_modified = metadata
@@ -553,60 +557,109 @@ impl IndexManager {
                         .duration_since(UNIX_EPOCH)
                         .unwrap()
                         .as_secs();
+                    
                     if let Some(entry) = self.index.get_file_entry(path) {
-                        if entry.modified == current_modified {
-                            valid_results.push(path.clone());
-                            continue;
+                        if entry.modified != current_modified {
+                            modified_files.push(path.clone());
                         }
+                        valid_results.push(path.clone());
                     }
-                    needs_reindex = true;
-                    valid_results.push(path.clone());
                 }
                 Err(_) => {
-                    needs_reindex = true;
+                    // File no longer exists
+                    removed_files.push(path.clone());
                 }
             }
         }
-
-        if needs_reindex {
-            if self.verbose {
-                println!("Changes detected, triggering background re-index");
+        
+        // Scan directories for new files
+        let dirs = Self::get_user_directories();
+        for dir in dirs {
+            if let Ok(entries) = fs::read_dir(&dir) {
+                for entry in entries.filter_map(Result::ok) {
+                    let path = entry.path();
+                    if !self.index.contains_file(&path) {
+                        added_files.push(path);
+                    }
+                }
             }
+        }
+        
+        // Handle changes immediately for this search
+        if !removed_files.is_empty() {
+            self.remove_files(&removed_files)?;
+        }
+        
+        if !added_files.is_empty() {
+            self.add_new_files(&added_files)?;
+            // Re-run search to include new files
+            let new_results = self.index.search(pattern);
+            valid_results.extend(new_results);
+        }
+        
+        if !modified_files.is_empty() {
+            self.update_modified_files(&modified_files)?;
+        }
+        
+        // Trigger background reindex if needed
+        if !removed_files.is_empty() || !added_files.is_empty() || !modified_files.is_empty() {
             self.background_reindex(self.verbose, Self::get_user_directories());
         }
-
-        if valid_results.is_empty() {
-            if self.verbose {
-                println!("No results found, performing lazy re-index...");
-            }
-            let recent_dirs = self.get_recently_modified_directories();
-            for dir in recent_dirs {
-                let _ = self.index_directory(&dir);
-            }
-
-            results = self.index.search(pattern);
-            valid_results = results.into_iter().filter(|p| p.exists()).collect();
-
-            if valid_results.is_empty() {
-                for dir in Self::get_user_directories() {
-                    let _ = self.index_directory(&dir);
-                }
-                let final_results = self.index.search(pattern);
-                valid_results = final_results.into_iter().filter(|p| p.exists()).collect();
-            }
-        }
-
-        valid_results.sort_by(|a, b| {
-            let a_score = self.compute_result_score(a);
-            let b_score = self.compute_result_score(b);
-            b_score.partial_cmp(&a_score).unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        if self.verbose {
-            println!("Search completed in {:?}", timer.elapsed());
-        }
-
+        
+        // Remove duplicates and sort
+        valid_results.sort_unstable();
+        valid_results.dedup();
+        
         Ok(valid_results)
+    }
+
+    fn remove_files(&mut self, files: &[PathBuf]) -> io::Result<()> {
+        for path in files {
+            // Remove from current chunk
+            self.index.current_chunk.files.remove(path);
+            
+            // Remove from terms
+            for terms in self.index.current_chunk.terms.values_mut() {
+                terms.remove(path);
+            }
+            
+            // Remove from chunks (would need to modify Index structure)
+            for chunk in &mut self.index.chunks {
+                chunk.files.remove(path);
+                for terms in chunk.terms.values_mut() {
+                    terms.remove(path);
+                }
+            }
+        }
+        self.index.save()?;
+        Ok(())
+    }
+    
+    fn add_new_files(&mut self, files: &[PathBuf]) -> io::Result<()> {
+        for path in files {
+            if let Ok(metadata) = fs::metadata(path) {
+                let modified = metadata
+                    .modified()
+                    .unwrap_or(UNIX_EPOCH)
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                    
+                self.index.add_file(FileEntry {
+                    path: path.clone(),
+                    modified,
+                    is_dir: metadata.is_dir(),
+                });
+            }
+        }
+        self.index.save()?;
+        Ok(())
+    }
+    
+    fn update_modified_files(&mut self, files: &[PathBuf]) -> io::Result<()> {
+        self.remove_files(files)?;
+        self.add_new_files(files)?;
+        Ok(())
     }
 
     // -----------------------------------------
@@ -657,13 +710,30 @@ impl IndexManager {
     fn update_directory_hash(&mut self, dir: &Path) -> io::Result<()> {
         let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let new_hash = Self::compute_directory_hash(dir)?;
-
+        
+        // Collect all files in directory and subdirectories
+        let mut known_files = HashSet::new();
+        for entry in WalkDir::new(dir)
+            .follow_links(true)
+            .into_iter()
+            .filter_map(|e| e.ok()) 
+        {
+            let path = entry.path().to_path_buf();
+            // Only add files, not directories
+            if let Ok(metadata) = entry.metadata() {
+                if !metadata.is_dir() {
+                    known_files.insert(path);
+                }
+            }
+        }
+    
         self.dir_hashes.hashes.insert(
             dir.to_path_buf(),
             DirectoryHash {
                 path: dir.to_path_buf(),
                 hash: new_hash,
                 last_check: current_time,
+                known_files,
             },
         );
         self.dir_hashes.save()
@@ -719,74 +789,13 @@ impl IndexManager {
     // -----------------------------------------
     pub fn get_user_directories() -> Vec<PathBuf> {
         let mut dirs = Vec::new();
-        if let Some(user_dirs) = directories_next::UserDirs::new() {
-            let standard_dirs = [
-                user_dirs.download_dir(),
-                user_dirs.desktop_dir(),
-                user_dirs.document_dir(),
-                user_dirs.picture_dir(),
-                user_dirs.audio_dir(),
-                user_dirs.video_dir(),
-                user_dirs.public_dir(),
-                user_dirs.template_dir(),
-            ];
+        // Add root directory
+        #[cfg(not(target_os = "windows"))]
+        dirs.push(PathBuf::from("/"));
 
-            for dir in standard_dirs.iter().filter_map(|d| *d) {
-                dirs.push(dir.to_path_buf());
-            }
+        #[cfg(target_os = "windows")]
+        dirs.push(PathBuf::from("C:\\"));
 
-            if let Some(home) = user_dirs.home_dir().to_str() {
-                #[cfg(target_os = "macos")]
-                {
-                    let app_dir = PathBuf::from(format!("{}/Applications", home));
-                    if app_dir.exists() {
-                        dirs.push(app_dir);
-                    }
-                    let system_app_dir = PathBuf::from("/Applications");
-                    if system_app_dir.exists() {
-                        dirs.push(system_app_dir);
-                    }
-                }
-
-                #[cfg(target_os = "linux")]
-                {
-                    let app_dir = PathBuf::from(format!("{}/.local/share/applications", home));
-                    if app_dir.exists() {
-                        dirs.push(app_dir);
-                    }
-                }
-
-                #[cfg(target_os = "windows")]
-                {
-                    let app_dir = PathBuf::from(format!("{}\\AppData\\Local\\Programs", home));
-                    if app_dir.exists() {
-                        dirs.push(app_dir);
-                    }
-                }
-            }
-
-            #[cfg(target_os = "macos")]
-            if let Some(home) = user_dirs.home_dir().to_str() {
-                let icloud_dir = PathBuf::from(format!("{}/Library/Mobile Documents", home));
-                if icloud_dir.exists() {
-                    dirs.push(icloud_dir.clone());
-                    if let Ok(entries) = fs::read_dir(&icloud_dir) {
-                        for entry in entries.filter_map(|e| e.ok()) {
-                            if let Ok(metadata) = entry.metadata() {
-                                if metadata.is_dir() {
-                                    dirs.push(entry.path());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            #[cfg(target_os = "windows")]
-            if let Ok(onedrive) = env::var("OneDriveConsumer") {
-                dirs.push(PathBuf::from(onedrive));
-            }
-        }
         dirs
     }
 }
