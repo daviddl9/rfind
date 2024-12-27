@@ -11,20 +11,31 @@ use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 /// Pattern matcher that supports both glob and fuzzy matching
 enum PatternMatcher {
     Glob(Pattern),
-    Substring(String),
+    Substring {
+        pattern_lower: String,
+    }
 }
 
 impl PatternMatcher {
     fn matches(&self, filename: &str) -> bool {
         match self {
             PatternMatcher::Glob(pattern) => pattern.matches(filename),
-            PatternMatcher::Substring(pattern) => {
-                filename.to_lowercase().contains(&pattern.to_lowercase())
+            PatternMatcher::Substring { pattern_lower } => {
+                filename.to_lowercase().contains(pattern_lower)
             }
         }
     }
 }
 
+fn create_pattern_matcher(pattern: &str) -> PatternMatcher {
+    if pattern.contains('*') || pattern.contains('?') {
+        PatternMatcher::Glob(Pattern::new(pattern).expect("Invalid glob pattern"))
+    } else {
+        PatternMatcher::Substring {
+            pattern_lower: pattern.to_lowercase()
+        }
+    }
+}
 /// Parallel recursive file finder with glob and fuzzy search support
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -52,15 +63,6 @@ struct WorkUnit {
     depth: usize,
 }
 
-fn create_pattern_matcher(pattern: &str) -> PatternMatcher {
-    // Check if pattern contains glob characters
-    if pattern.contains('*') || pattern.contains('?') {
-        PatternMatcher::Glob(Pattern::new(pattern).expect("Invalid glob pattern"))
-    } else {
-        PatternMatcher::Substring(pattern.to_string())
-    }
-}
-
 fn main() {
     // Start timing
     let start_time = Instant::now();
@@ -76,7 +78,7 @@ fn main() {
     let active_scanners = Arc::new(AtomicUsize::new(0));
     
     // Channels for work distribution and result collection
-    let (work_tx, work_rx) = bounded::<WorkUnit>(thread_count * 2);
+    let (work_tx, work_rx) = bounded::<WorkUnit>(thread_count * 8);
     let (result_tx, result_rx) = unbounded();
     let (dir_tx, dir_rx) = unbounded();
 
@@ -97,6 +99,9 @@ fn main() {
         let active_scanners = Arc::clone(&active_scanners);
         
         let handle = thread::spawn(move || {
+            // Pre-allocate buffers for paths
+            let mut dir_entries = Vec::with_capacity(100);
+            
             while let Ok(work) = work_rx.recv() {
                 active_scanners.fetch_add(1, Ordering::SeqCst);
                 
@@ -104,7 +109,9 @@ fn main() {
                     active_scanners.fetch_sub(1, Ordering::SeqCst);
                     continue;
                 }
-
+        
+                dir_entries.clear(); // Reuse allocated memory
+                
                 let read_dir = match std::fs::read_dir(&work.path) {
                     Ok(dir) => dir,
                     Err(_) => {
@@ -112,16 +119,18 @@ fn main() {
                         continue;
                     }
                 };
-
-                for entry in read_dir.filter_map(Result::ok) {
+        
+                // Collect entries first to minimize lock time
+                dir_entries.extend(read_dir.filter_map(Result::ok));
+        
+                for entry in dir_entries.iter() {
                     let path = entry.path();
                     let file_type = match entry.file_type() {
                         Ok(ft) => ft,
                         Err(_) => continue,
                     };
-
+        
                     if file_type.is_dir() {
-                        // Send subdirectory for processing
                         if dir_tx.send(WorkUnit {
                             path: path.to_path_buf(),
                             depth: work.depth + 1,
