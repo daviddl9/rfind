@@ -1,20 +1,35 @@
 use std::path::PathBuf;
 use std::thread;
 use std::time::Instant;
-use walkdir::DirEntry;
 use glob::Pattern;
 use clap::Parser;
 use colored::*;
-use rayon::prelude::*;
 use num_cpus;
 use crossbeam_channel::{bounded, unbounded};
 use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 
-/// Parallel recursive file finder
+/// Pattern matcher that supports both glob and fuzzy matching
+enum PatternMatcher {
+    Glob(Pattern),
+    Substring(String),
+}
+
+impl PatternMatcher {
+    fn matches(&self, filename: &str) -> bool {
+        match self {
+            PatternMatcher::Glob(pattern) => pattern.matches(filename),
+            PatternMatcher::Substring(pattern) => {
+                filename.to_lowercase().contains(&pattern.to_lowercase())
+            }
+        }
+    }
+}
+
+/// Parallel recursive file finder with glob and fuzzy search support
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Pattern to search for (supports glob patterns like *.log)
+    /// Pattern to search for (glob patterns like *.log or substring search)
     #[arg(required = true)]
     pattern: String,
 
@@ -31,17 +46,19 @@ struct Args {
     threads: Option<usize>,
 }
 
-fn is_hidden(entry: &DirEntry) -> bool {
-    entry.file_name()
-        .to_str()
-        .map(|s| s.starts_with("."))
-        .unwrap_or(false)
-}
-
 /// Represents a work unit for directory scanning
 struct WorkUnit {
     path: PathBuf,
     depth: usize,
+}
+
+fn create_pattern_matcher(pattern: &str) -> PatternMatcher {
+    // Check if pattern contains glob characters
+    if pattern.contains('*') || pattern.contains('?') {
+        PatternMatcher::Glob(Pattern::new(pattern).expect("Invalid glob pattern"))
+    } else {
+        PatternMatcher::Substring(pattern.to_string())
+    }
 }
 
 fn main() {
@@ -49,7 +66,7 @@ fn main() {
     let start_time = Instant::now();
     
     let args = Args::parse();
-    let pattern = Arc::new(Pattern::new(&args.pattern).expect("Invalid pattern"));
+    let pattern = Arc::new(create_pattern_matcher(&args.pattern));
     let max_depth = args.max_depth;
     
     // Determine number of worker threads
@@ -83,7 +100,7 @@ fn main() {
             while let Ok(work) = work_rx.recv() {
                 active_scanners.fetch_add(1, Ordering::SeqCst);
                 
-                if work.depth >= max_depth {
+                if work.depth > max_depth {
                     active_scanners.fetch_sub(1, Ordering::SeqCst);
                     continue;
                 }
@@ -112,7 +129,6 @@ fn main() {
                             break;
                         }
                     } else if file_type.is_file() {
-                        // Check if file matches pattern
                         if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
                             if pattern.matches(file_name) {
                                 if result_tx.send(path).is_err() {
@@ -133,16 +149,14 @@ fn main() {
     let work_tx_clone = work_tx.clone();
     let active_scanners = Arc::clone(&active_scanners);
     let distributor_handle = thread::spawn(move || {
-        let mut pending_dirs = vec![true]; // Track each directory separately
+        let mut pending_dirs = vec![true];
         let mut current_index = 0;
         
         loop {
-            // First check if we're done
             if pending_dirs.iter().all(|&x| !x) {
                 break;
             }
             
-            // Process any new directories
             match dir_rx.try_recv() {
                 Ok(dir) => {
                     pending_dirs.push(true);
@@ -151,22 +165,18 @@ fn main() {
                     }
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => {
-                    // No new directories, check active scanners
                     if active_scanners.load(Ordering::SeqCst) == 0 {
-                        // Mark current batch as complete
                         for i in current_index..pending_dirs.len() {
                             pending_dirs[i] = false;
                         }
                         current_index = pending_dirs.len();
                     }
-                    // Small sleep to prevent busy waiting
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
                 Err(crossbeam_channel::TryRecvError::Disconnected) => break,
             }
         }
         
-        // Signal end of work
         drop(work_tx_clone);
     });
 
@@ -179,7 +189,7 @@ fn main() {
     let mut count = 0;
     while let Ok(path) = result_rx.recv() {
         count += 1;
-        println!("{}", format!("Found: {}", path.display()).green());
+        println!("{}", format!("{}", path.display()).green());
     }
 
     // Wait for all threads to complete
