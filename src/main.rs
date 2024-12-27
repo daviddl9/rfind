@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{collections::HashSet, path::PathBuf};
 use std::thread;
 use std::time::Instant;
 use glob::Pattern;
@@ -149,29 +149,31 @@ fn main() {
     let work_tx_clone = work_tx.clone();
     let active_scanners = Arc::clone(&active_scanners);
     let distributor_handle = thread::spawn(move || {
-        let mut pending_dirs = vec![true];
-        let mut current_index = 0;
+        let mut pending_dirs = HashSet::new();
+        pending_dirs.insert(String::from("initial"));
+        
+        // Use a counter for empty channel reads before checking scanners
+        let mut empty_reads = 0;
+        const MAX_EMPTY_READS: u8 = 3;
         
         loop {
-            if pending_dirs.iter().all(|&x| !x) {
-                break;
-            }
-            
             match dir_rx.try_recv() {
                 Ok(dir) => {
-                    pending_dirs.push(true);
+                    empty_reads = 0; // Reset counter on successful read
+                    pending_dirs.insert(dir.path.to_string_lossy().to_string());
                     if work_tx_clone.send(dir).is_err() {
                         break;
                     }
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => {
-                    if active_scanners.load(Ordering::SeqCst) == 0 {
-                        for i in current_index..pending_dirs.len() {
-                            pending_dirs[i] = false;
-                        }
-                        current_index = pending_dirs.len();
+                    empty_reads += 1;
+                    if empty_reads >= MAX_EMPTY_READS && 
+                       active_scanners.load(Ordering::SeqCst) == 0 && 
+                       dir_rx.is_empty() {
+                        break;
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    // Shorter sleep when channel is empty
+                    thread::sleep(std::time::Duration::from_micros(100));
                 }
                 Err(crossbeam_channel::TryRecvError::Disconnected) => break,
             }
