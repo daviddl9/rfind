@@ -36,7 +36,7 @@ fn create_pattern_matcher(pattern: &str) -> PatternMatcher {
         }
     }
 }
-/// Parallel recursive file finder with glob and fuzzy search support
+/// Parallel recursive file finder
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
