@@ -80,7 +80,7 @@ rfind achieves its exceptional performance through:
 
 ## 📄 License
 
-MIT License
+[MIT License](https://github.com/daviddl9/rfind/blob/main/LICENSE)
 
 ## 🤝 Contributing
 
