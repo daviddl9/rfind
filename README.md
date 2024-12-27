@@ -1,7 +1,7 @@
 # 🚀 rfind
 [![CI](https://github.com/daviddl9/rfind/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/daviddl9/rfind/actions/workflows/ci.yml)
 
-A blazingly fast parallel recursive file finder written in Rust that supports both glob patterns and fuzzy search. It is a **supercharged** alternative to the classic [\*nix `find`](https://man7.org/linux/man-pages/man1/find.1.html) command.
+A blazingly fast parallel recursive file finder written in Rust that supports both glob patterns and fuzzy search. It is a **supercharged** alternative to the classic [\*nix `find`](https://man7.org/linux/man-pages/man1/find.1.html) command, written in 200 lines of Rust.
 
 ## ✨ Features
 
@@ -14,9 +14,9 @@ A blazingly fast parallel recursive file finder written in Rust that supports bo
 
 ## 💨 Performance
 
-In benchmarks on large directory structures (1M+ files), RFind consistently outperforms the traditional UNIX `find` command:
+In benchmarks on large directory structures (1M+ files), rfind consistently outperforms the traditional UNIX `find` command:
 
-* 🏃 Directory with 1M files: `find` takes ~45s, RFind completes in ~4s
+* 🏃 Directory with 1M files: `find` takes ~45s, rfind completes in ~4s
 * 📁 Deep nested structures: Up to 12x performance improvement
 * 💾 SSD optimization: Maximizes I/O throughput with parallel workers
 
@@ -26,7 +26,7 @@ In benchmarks on large directory structures (1M+ files), RFind consistently outp
 rfind [OPTIONS] <PATTERN>
 
 Options:
-  -d, --dir <DIR>         Starting directory (defaults to current directory)
+  -d, --dir <DIR>         Starting directory (defaults to root directory)
   -m, --max-depth <DEPTH> Maximum search depth [default: 100]
   -t, --threads <COUNT>   Number of worker threads (defaults to CPU core count)
   -h, --help             Print help
@@ -52,13 +52,26 @@ rfind "backup"
 
 ## 🔧 Installation
 
-```bash
-cargo install rfind
-```
+1. **Install [Rust](https://www.rust-lang.org/tools/install)** (stable or newer).
+2. Clone this repository:
+
+   ```bash
+   git clone https://github.com/daviddl9/rfind.git
+   cd rfind
+   ```
+
+3. **Build and install**:
+
+   ```bash
+   cargo build --release
+   cargo install --path .
+   ```
+
+   This places the `rfind` binary in your Cargo bin directory (e.g. `~/.cargo/bin`).
 
 ## ⚡ How It Works
 
-RFind achieves its exceptional performance through:
+rfind achieves its exceptional performance through:
 - Multi-threaded directory traversal
 - Efficient work distribution using crossbeam channels
 - Smart memory management with pre-allocated buffers

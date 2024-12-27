@@ -44,7 +44,7 @@ struct Args {
     #[arg(required = true)]
     pattern: String,
 
-    /// Starting directory (defaults to current directory)
+    /// Starting directory (defaults to root directory)
     #[arg(short, long, default_value = "/")]
     dir: PathBuf,
 
