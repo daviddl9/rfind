@@ -108,8 +108,9 @@ struct ScannerContext {
 }
 
 fn normalize_path(path: &Path, root: &Path) -> PathBuf {
-    // Get the difference between the path and root to maintain relative paths
-    diff_paths(path, root).unwrap_or_else(|| path.to_path_buf())
+    let root_parent = root.parent().unwrap_or_else(|| Path::new(""));
+    // This will maintain the root directory name in the path
+    diff_paths(path, root_parent).unwrap_or_else(|| path.to_path_buf())
 }
 
 struct ScannerChannels {
@@ -382,6 +383,7 @@ fn setup_thread_pool(
         result_receiver: channels.result_rx,
     }
 }
+
 fn main() {
     let args = Args::parse();
     let pattern = Arc::new(create_pattern_matcher(&args.pattern));
@@ -390,11 +392,11 @@ fn main() {
     
     let channels = create_channels(thread_count);
     
-    // Get the absolute path of the root directory
+    // Get the canonical path of the root directory's parent
     let root_path = std::fs::canonicalize(&args.dir)
         .unwrap_or_else(|_| args.dir.clone());
 
-    // Submit initial work unit
+    // Submit initial work unit with the full path
     channels.work_tx.send(WorkUnit {
         path: root_path.clone(),
         depth: 0,
