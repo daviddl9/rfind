@@ -106,14 +106,10 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             let reader = BufReader::new(stdout);
             for line in reader.lines() {
                 let line = line?;
-                if !line.contains("Total matches found:") && 
-                   !line.contains("Used") && 
-                   !line.contains("Total time:") {
-                    if let Some(file_name) = Path::new(&line.trim())
-                        .file_name()
-                        .and_then(|n| n.to_str()) {
-                        found_files.insert(String::from(file_name));
-                    }
+                if let Some(file_name) = Path::new(&line.trim())
+                    .file_name()
+                    .and_then(|n| n.to_str()) {
+                    found_files.insert(String::from(file_name));
                 }
             }
         }
