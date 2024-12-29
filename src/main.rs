@@ -10,6 +10,7 @@ use colored::*;
 use num_cpus;
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+use pathdiff::diff_paths;
 
 #[derive(Debug, Clone, Copy)]
 enum SymlinkMode {
@@ -103,6 +104,12 @@ struct ScannerContext {
     symlink_mode: SymlinkMode,
     is_command_line: bool,  // True for initial directory
     visited_paths: Arc<Mutex<HashSet<PathBuf>>>,  // For loop detection
+    root_path: PathBuf,
+}
+
+fn normalize_path(path: &Path, root: &Path) -> PathBuf {
+    // Get the difference between the path and root to maintain relative paths
+    diff_paths(path, root).unwrap_or_else(|| path.to_path_buf())
 }
 
 struct ScannerChannels {
@@ -140,57 +147,38 @@ fn handle_entry(
     channels: &ScannerChannels,
 ) -> Result<(), Box<dyn Error>> {
     let path = entry.path();
-    
-    // Get file_type with fallback handling
-    let file_type = match entry.file_type() {
-        Ok(ft) => ft,
-        Err(e) => {
-            // Log the error if you want to track these cases
-            debug!("Unable to get file type for {:?}: {}", path, e);
-            return Ok(());
-        }
-    };
+    let file_type = entry.file_type()?;
 
-    // First check if it's a symlink that matches our pattern
+    // Normalize the path relative to root
+    let relative_path = normalize_path(&path, &ctx.root_path);
+
     if file_type.is_symlink() {
         if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
             if ctx.pattern.matches(file_name) {
-                // Try to send the symlink path, but don't fail if we can't
-                if let Err(e) = channels.result_tx.send(path.clone()) {
-                    debug!("Failed to send result for symlink {:?}: {}", path, e);
-                    return Ok(());
-                }
+                channels.result_tx.send(relative_path.clone())?;
             }
         }
         
-        // Handle symlink traversal with better error handling
         match handle_symlink(&path, file_type, ctx, channels) {
             Ok(_) => (),
-            Err(e) => {
-                debug!("Error handling symlink {:?}: {}", path, e);
-            }
+            Err(e) => debug!("Error handling symlink {:?}: {}", path, e),
         }
         return Ok(());
     }
 
-    // Handle regular files and directories
     if file_type.is_dir() {
-        if let Err(e) = handle_directory(path.clone(), ctx.work.depth, ctx, channels) {
-            debug!("Error handling directory {:?}: {}", path, e);
-        }
+        handle_directory(path, ctx.work.depth, ctx, channels)?;
     } else if file_type.is_file() {
         if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
             if ctx.pattern.matches(file_name) {
-                let cloned_path = path.clone();
-                if let Err(e) = channels.result_tx.send(path) {
-                    debug!("Failed to send result for file {:?}: {}", cloned_path, e);
-                }
+                channels.result_tx.send(relative_path)?;
             }
         }
     }
 
     Ok(())
 }
+
 
 fn handle_symlink(
     path: &Path,
@@ -202,55 +190,29 @@ fn handle_symlink(
         return Ok(false);
     }
 
-    // Read symlink with better error handling
-    let real_path = match std::fs::read_link(path) {
-        Ok(p) => p,
-        Err(e) => {
-            debug!("Failed to read symlink {:?}: {}", path, e);
-            return Ok(false);
-        }
-    };
-
-    let absolute_path = if real_path.is_relative() {
-        path.parent()
-            .unwrap_or_else(|| Path::new(""))
-            .join(real_path)
-    } else {
-        real_path
-    };
-
-    // Check for symlink loops
-    {
-        let mut visited = match ctx.visited_paths.lock() {
-            Ok(guard) => guard,
-            Err(e) => {
-                debug!("Failed to acquire lock for visited paths: {}", e);
-                return Ok(false);
-            }
-        };
-        
-        if !visited.insert(absolute_path.clone()) {
+    // Keep the original symlink path for directory traversal
+    let symlink_path = path.to_path_buf();
+    
+    // Check for symlink loops using canonical paths
+    let canonical = path.canonicalize().ok();
+    if let Some(canonical_path) = canonical {
+        let mut visited = ctx.visited_paths.lock().unwrap();
+        if !visited.insert(canonical_path) {
             return Ok(false);
         }
     }
 
-    // Get metadata with better error handling
-    match std::fs::metadata(&absolute_path) {
+    match std::fs::metadata(&symlink_path) {
         Ok(metadata) => {
             if metadata.is_dir() {
-                let cloned_path = absolute_path.clone();
-                if let Err(e) = handle_directory(absolute_path, ctx.work.depth, ctx, channels) {
-                    debug!("Error handling symlinked directory {:?}: {}", cloned_path, e);
-                }
+                // Use the original symlink path for directory traversal
+                handle_directory(symlink_path, ctx.work.depth, ctx, channels)?;
                 Ok(false)
             } else {
                 Ok(metadata.is_file())
             }
         }
-        Err(e) => {
-            debug!("Failed to get metadata for {:?}: {}", absolute_path, e);
-            Ok(false)
-        }
+        Err(_) => Ok(false)
     }
 }
 
@@ -262,6 +224,7 @@ fn spawn_scanner_thread(
     active_scanners: Arc<AtomicUsize>,
     max_depth: usize,
     symlink_mode: SymlinkMode,
+    root_path: PathBuf,  // Add root path parameter
 ) -> thread::JoinHandle<()> {
     let visited_paths = Arc::new(Mutex::new(HashSet::new()));
 
@@ -282,6 +245,7 @@ fn spawn_scanner_thread(
                 symlink_mode,
                 is_command_line: work.depth == 0,
                 visited_paths: Arc::clone(&visited_paths),
+                root_path: root_path.clone(),
             };
 
             // More defensive read_dir handling
@@ -385,6 +349,7 @@ fn setup_thread_pool(
     channels: ChannelSet,
     max_depth: usize,
     symlink_mode: SymlinkMode,
+    root_path: PathBuf,
 ) -> ThreadPool {
     let active_scanners = Arc::new(AtomicUsize::new(0));
     let mut scanner_handles = Vec::with_capacity(thread_count);
@@ -399,6 +364,7 @@ fn setup_thread_pool(
             Arc::clone(&active_scanners),
             max_depth,
             symlink_mode,
+            root_path.clone(),
         );
         scanner_handles.push(handle);
     }
@@ -417,7 +383,6 @@ fn setup_thread_pool(
     }
 }
 fn main() {
-    env_logger::init();
     let args = Args::parse();
     let pattern = Arc::new(create_pattern_matcher(&args.pattern));
     let thread_count = args.threads.unwrap_or_else(num_cpus::get);
@@ -425,9 +390,13 @@ fn main() {
     
     let channels = create_channels(thread_count);
     
+    // Get the absolute path of the root directory
+    let root_path = std::fs::canonicalize(&args.dir)
+        .unwrap_or_else(|_| args.dir.clone());
+
     // Submit initial work unit
     channels.work_tx.send(WorkUnit {
-        path: args.dir.clone(),
+        path: root_path.clone(),
         depth: 0,
     }).expect("Failed to send initial work");
 
@@ -437,7 +406,9 @@ fn main() {
         channels,
         args.max_depth,
         symlink_mode,
+        root_path,
     );
+
     // Process results
     while let Ok(path) = thread_pool.result_receiver.recv() {
         println!("{}", format!("{}", path.display()).green());
