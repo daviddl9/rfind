@@ -1,6 +1,5 @@
 use std::{collections::HashSet, path::PathBuf};
 use std::thread;
-use std::time::Instant;
 use glob::Pattern;
 use clap::Parser;
 use colored::*;
@@ -64,9 +63,6 @@ struct WorkUnit {
 }
 
 fn main() {
-    // Start timing
-    let start_time = Instant::now();
-    
     let args = Args::parse();
     let pattern = Arc::new(create_pattern_matcher(&args.pattern));
     let max_depth = args.max_depth;
@@ -196,10 +192,7 @@ fn main() {
     drop(dir_tx);
     drop(result_tx);
 
-    // Print results as they come in
-    let mut count = 0;
     while let Ok(path) = result_rx.recv() {
-        count += 1;
         println!("{}", format!("{}", path.display()).green());
     }
 
@@ -208,11 +201,4 @@ fn main() {
         handle.join().unwrap();
     }
     distributor_handle.join().unwrap();
-
-    // Calculate and print elapsed time
-    let elapsed = start_time.elapsed();
-    
-    println!("\n{}", format!("Total matches found: {}", count).blue());
-    println!("{}", format!("Used {} worker threads", thread_count).yellow());
-    println!("{}", format!("Total time: {:.2?}", elapsed).cyan());
 }
