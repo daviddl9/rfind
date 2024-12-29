@@ -101,7 +101,6 @@ struct ScannerContext {
     work: WorkUnit,
     pattern: Arc<PatternMatcher>,
     symlink_mode: SymlinkMode,
-    max_depth: usize,
     is_command_line: bool,  // True for initial directory
     visited_paths: Arc<Mutex<HashSet<PathBuf>>>,  // For loop detection
 }
@@ -114,7 +113,7 @@ struct ScannerChannels {
 fn handle_directory(
     path: PathBuf,
     depth: usize,
-    ctx: &ScannerContext,
+    _ctx: &ScannerContext,
     channels: &ScannerChannels,
 ) -> Result<(), Box<dyn Error>> {
     channels.dir_tx.send(WorkUnit {
@@ -281,7 +280,6 @@ fn spawn_scanner_thread(
                 work: work.clone(),
                 pattern: Arc::clone(&pattern),
                 symlink_mode,
-                max_depth,
                 is_command_line: work.depth == 0,
                 visited_paths: Arc::clone(&visited_paths),
             };
@@ -420,7 +418,6 @@ fn setup_thread_pool(
 }
 fn main() {
     env_logger::init();
-    let args = Args::parse();
     let args = Args::parse();
     let pattern = Arc::new(create_pattern_matcher(&args.pattern));
     let thread_count = args.threads.unwrap_or_else(num_cpus::get);
