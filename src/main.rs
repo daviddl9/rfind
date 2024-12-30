@@ -1,36 +1,31 @@
+use clap::Parser;
+use colored::*;
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
+use glob::Pattern;
+use log::debug;
+use pathdiff::diff_paths;
 use std::error::Error;
 use std::path::Path;
 use std::sync::Mutex;
-use log::debug;
-use std::{collections::HashSet, path::PathBuf};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use std::thread;
-use glob::Pattern;
-use clap:: Parser;
-use colored::*;
-use num_cpus;
-use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
-use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
-use pathdiff::diff_paths;
+use std::{collections::HashSet, path::PathBuf};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Default, Debug, Clone, Copy)]
 enum SymlinkMode {
-    Never,      // -P: Never follow symlinks
-    Command,    // -H: Follow symlinks on command line only
-    Always,     // -L: Follow all symlinks
-}
-
-impl Default for SymlinkMode {
-    fn default() -> Self {
-        SymlinkMode::Never  // Default to -P behavior
-    }
+    #[default]
+    Never, // -P: Never follow symlinks
+    Command, // -H: Follow symlinks on command line only
+    Always,  // -L: Follow all symlinks
 }
 
 /// Pattern matcher that supports both glob and fuzzy matching
 enum PatternMatcher {
     Glob(Pattern),
-    Substring {
-        pattern_lower: String,
-    }
+    Substring { pattern_lower: String },
 }
 
 impl PatternMatcher {
@@ -49,7 +44,7 @@ fn create_pattern_matcher(pattern: &str) -> PatternMatcher {
         PatternMatcher::Glob(Pattern::new(pattern).expect("Invalid glob pattern"))
     } else {
         PatternMatcher::Substring {
-            pattern_lower: pattern.to_lowercase()
+            pattern_lower: pattern.to_lowercase(),
         }
     }
 }
@@ -102,8 +97,8 @@ struct ScannerContext {
     work: WorkUnit,
     pattern: Arc<PatternMatcher>,
     symlink_mode: SymlinkMode,
-    is_command_line: bool,  // True for initial directory
-    visited_paths: Arc<Mutex<HashSet<PathBuf>>>,  // For loop detection
+    is_command_line: bool,                       // True for initial directory
+    visited_paths: Arc<Mutex<HashSet<PathBuf>>>, // For loop detection
     root_path: PathBuf,
 }
 
@@ -131,10 +126,7 @@ fn handle_directory(
     Ok(())
 }
 
-fn should_follow_symlink(
-    ctx: &ScannerContext,
-    is_command_path: bool,
-) -> bool {
+fn should_follow_symlink(ctx: &ScannerContext, is_command_path: bool) -> bool {
     match ctx.symlink_mode {
         SymlinkMode::Never => false,
         SymlinkMode::Command => is_command_path,
@@ -159,7 +151,7 @@ fn handle_entry(
                 channels.result_tx.send(relative_path.clone())?;
             }
         }
-        
+
         match handle_symlink(&path, file_type, ctx, channels) {
             Ok(_) => (),
             Err(e) => debug!("Error handling symlink {:?}: {}", path, e),
@@ -180,7 +172,6 @@ fn handle_entry(
     Ok(())
 }
 
-
 fn handle_symlink(
     path: &Path,
     _file_type: std::fs::FileType,
@@ -193,7 +184,7 @@ fn handle_symlink(
 
     // Keep the original symlink path for directory traversal
     let symlink_path = path.to_path_buf();
-    
+
     // Check for symlink loops using canonical paths
     let canonical = path.canonicalize().ok();
     if let Some(canonical_path) = canonical {
@@ -213,7 +204,7 @@ fn handle_symlink(
                 Ok(metadata.is_file())
             }
         }
-        Err(_) => Ok(false)
+        Err(_) => Ok(false),
     }
 }
 
@@ -225,16 +216,16 @@ fn spawn_scanner_thread(
     active_scanners: Arc<AtomicUsize>,
     max_depth: usize,
     symlink_mode: SymlinkMode,
-    root_path: PathBuf,  // Add root path parameter
+    root_path: PathBuf, // Add root path parameter
 ) -> thread::JoinHandle<()> {
     let visited_paths = Arc::new(Mutex::new(HashSet::new()));
 
     thread::spawn(move || {
         let channels = ScannerChannels { dir_tx, result_tx };
-        
+
         while let Ok(work) = work_rx.recv() {
             active_scanners.fetch_add(1, Ordering::SeqCst);
-            
+
             if work.depth > max_depth {
                 active_scanners.fetch_sub(1, Ordering::SeqCst);
                 continue;
@@ -264,12 +255,11 @@ fn spawn_scanner_thread(
                     debug!("Error processing entry: {}", e);
                 }
             }
-            
+
             active_scanners.fetch_sub(1, Ordering::SeqCst);
         }
     })
 }
-
 
 /// Represents a work unit for directory scanning
 #[derive(Debug, Clone)]
@@ -297,7 +287,7 @@ fn create_channels(thread_count: usize) -> ChannelSet {
     let (work_tx, work_rx) = bounded(thread_count * 8);
     let (result_tx, result_rx) = unbounded();
     let (dir_tx, dir_rx) = unbounded();
-    
+
     ChannelSet {
         work_tx,
         work_rx,
@@ -316,10 +306,10 @@ fn spawn_work_distributor(
     thread::spawn(move || {
         let mut pending_dirs = HashSet::new();
         pending_dirs.insert(String::from("initial"));
-        
+
         let mut empty_reads = 0;
         const MAX_EMPTY_READS: u8 = 3;
-        
+
         loop {
             match dir_rx.try_recv() {
                 Ok(dir) => {
@@ -331,9 +321,10 @@ fn spawn_work_distributor(
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => {
                     empty_reads += 1;
-                    if empty_reads >= MAX_EMPTY_READS && 
-                       active_scanners.load(Ordering::SeqCst) == 0 && 
-                       dir_rx.is_empty() {
+                    if empty_reads >= MAX_EMPTY_READS
+                        && active_scanners.load(Ordering::SeqCst) == 0
+                        && dir_rx.is_empty()
+                    {
                         break;
                     }
                     thread::sleep(std::time::Duration::from_micros(100));
@@ -354,7 +345,7 @@ fn setup_thread_pool(
 ) -> ThreadPool {
     let active_scanners = Arc::new(AtomicUsize::new(0));
     let mut scanner_handles = Vec::with_capacity(thread_count);
-    
+
     // Spawn scanner threads
     for _ in 0..thread_count {
         let handle = spawn_scanner_thread(
@@ -389,18 +380,20 @@ fn main() {
     let pattern = Arc::new(create_pattern_matcher(&args.pattern));
     let thread_count = args.threads.unwrap_or_else(num_cpus::get);
     let symlink_mode = args.symlink_mode();
-    
+
     let channels = create_channels(thread_count);
-    
+
     // Get the canonical path of the root directory's parent
-    let root_path = std::fs::canonicalize(&args.dir)
-        .unwrap_or_else(|_| args.dir.clone());
+    let root_path = std::fs::canonicalize(&args.dir).unwrap_or_else(|_| args.dir.clone());
 
     // Submit initial work unit with the full path
-    channels.work_tx.send(WorkUnit {
-        path: root_path.clone(),
-        depth: 0,
-    }).expect("Failed to send initial work");
+    channels
+        .work_tx
+        .send(WorkUnit {
+            path: root_path.clone(),
+            depth: 0,
+        })
+        .expect("Failed to send initial work");
 
     let thread_pool = setup_thread_pool(
         thread_count,

@@ -1,10 +1,10 @@
-use std::fs;
-use std::path::Path;
-use std::process::{Command, Stdio};
-use std::io::{BufRead, BufReader};
-use tempfile::TempDir;
 use std::collections::HashSet;
 use std::env;
+use std::fs;
+use std::io::{BufRead, BufReader};
+use std::path::Path;
+use std::process::{Command, Stdio};
+use tempfile::TempDir;
 
 #[test]
 fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
@@ -46,22 +46,36 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
     let test_cases = vec![
         TestCase {
             pattern: "*.log",
-            expected_files: vec!["test2.log", "test4.log", "test6.log"].into_iter().map(String::from).collect(),
+            expected_files: vec!["test2.log", "test4.log", "test6.log"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
             max_depth: None,
             threads: Some(1),
         },
         TestCase {
             pattern: "test",
             expected_files: vec![
-                "test1.txt", "test2.log", "test3.txt", "test4.log",
-                "test5.txt", "test6.log", "test7.txt"
-            ].into_iter().map(String::from).collect(),
+                "test1.txt",
+                "test2.log",
+                "test3.txt",
+                "test4.log",
+                "test5.txt",
+                "test6.log",
+                "test7.txt",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
             max_depth: None,
             threads: Some(1),
         },
         TestCase {
             pattern: "*.txt",
-            expected_files: vec!["test1.txt", "test3.txt", "test5.txt"].into_iter().map(String::from).collect(),
+            expected_files: vec!["test1.txt", "test3.txt", "test5.txt"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
             max_depth: Some(2),
             threads: Some(1),
         },
@@ -76,39 +90,37 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
     // Run test cases
     for test_case in test_cases {
         println!("\nRunning test case for pattern: {}", test_case.pattern);
-        
+
         let mut cmd = Command::new(&bin_path);
-        
+
         cmd.arg(&test_case.pattern)
-           .arg("--dir")
-           .arg(base_path)
-           .stdout(Stdio::piped())
-           .stderr(Stdio::piped());
+            .arg("--dir")
+            .arg(base_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
         if let Some(depth) = test_case.max_depth {
-            cmd.arg("--max-depth")
-               .arg(depth.to_string());
+            cmd.arg("--max-depth").arg(depth.to_string());
         }
 
         if let Some(threads) = test_case.threads {
-            cmd.arg("--threads")
-               .arg(threads.to_string());
+            cmd.arg("--threads").arg(threads.to_string());
         }
 
         // Run the command
         let mut child = cmd.spawn()?;
-        
+
         // Create a set to store found files
         let mut found_files = HashSet::new();
-        
+
         // Read stdout line by line
         if let Some(stdout) = child.stdout.take() {
             let reader = BufReader::new(stdout);
             for line in reader.lines() {
                 let line = line?;
-                if let Some(file_name) = Path::new(&line.trim())
-                    .file_name()
-                    .and_then(|n| n.to_str()) {
+                if let Some(file_name) =
+                    Path::new(&line.trim()).file_name().and_then(|n| n.to_str())
+                {
                     found_files.insert(String::from(file_name));
                 }
             }
@@ -123,14 +135,11 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
         println!("Found files: {:?}", found_files);
 
         // Check for missing files
-        let missing_files: HashSet<_> = test_case.expected_files
-            .difference(&found_files)
-            .collect();
-        
+        let missing_files: HashSet<_> = test_case.expected_files.difference(&found_files).collect();
+
         // Check for unexpected files
-        let unexpected_files: HashSet<_> = found_files
-            .difference(&test_case.expected_files)
-            .collect();
+        let unexpected_files: HashSet<_> =
+            found_files.difference(&test_case.expected_files).collect();
 
         assert!(
             missing_files.is_empty() && unexpected_files.is_empty(),
