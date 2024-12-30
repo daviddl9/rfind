@@ -208,7 +208,7 @@ fn handle_symlink(
     }
 }
 
-fn spawn_scanner_thread(
+struct ScannerConfig {
     work_rx: Receiver<WorkUnit>,
     dir_tx: Sender<WorkUnit>,
     result_tx: Sender<PathBuf>,
@@ -216,28 +216,33 @@ fn spawn_scanner_thread(
     active_scanners: Arc<AtomicUsize>,
     max_depth: usize,
     symlink_mode: SymlinkMode,
-    root_path: PathBuf, // Add root path parameter
-) -> thread::JoinHandle<()> {
+    root_path: PathBuf,
+}
+
+fn spawn_scanner_thread(config: ScannerConfig) -> thread::JoinHandle<()> {
     let visited_paths = Arc::new(Mutex::new(HashSet::new()));
 
     thread::spawn(move || {
-        let channels = ScannerChannels { dir_tx, result_tx };
+        let channels = ScannerChannels {
+            dir_tx: config.dir_tx,
+            result_tx: config.result_tx,
+        };
 
-        while let Ok(work) = work_rx.recv() {
-            active_scanners.fetch_add(1, Ordering::SeqCst);
+        while let Ok(work) = config.work_rx.recv() {
+            config.active_scanners.fetch_add(1, Ordering::SeqCst);
 
-            if work.depth > max_depth {
-                active_scanners.fetch_sub(1, Ordering::SeqCst);
+            if work.depth > config.max_depth {
+                config.active_scanners.fetch_sub(1, Ordering::SeqCst);
                 continue;
             }
 
             let ctx = ScannerContext {
                 work: work.clone(),
-                pattern: Arc::clone(&pattern),
-                symlink_mode,
+                pattern: Arc::clone(&config.pattern),
+                symlink_mode: config.symlink_mode,
                 is_command_line: work.depth == 0,
                 visited_paths: Arc::clone(&visited_paths),
-                root_path: root_path.clone(),
+                root_path: config.root_path.clone(),
             };
 
             // More defensive read_dir handling
@@ -245,7 +250,7 @@ fn spawn_scanner_thread(
                 Ok(dir) => dir,
                 Err(e) => {
                     debug!("Failed to read directory {:?}: {}", work.path, e);
-                    active_scanners.fetch_sub(1, Ordering::SeqCst);
+                    config.active_scanners.fetch_sub(1, Ordering::SeqCst);
                     continue;
                 }
             };
@@ -256,7 +261,7 @@ fn spawn_scanner_thread(
                 }
             }
 
-            active_scanners.fetch_sub(1, Ordering::SeqCst);
+            config.active_scanners.fetch_sub(1, Ordering::SeqCst);
         }
     })
 }
@@ -348,16 +353,16 @@ fn setup_thread_pool(
 
     // Spawn scanner threads
     for _ in 0..thread_count {
-        let handle = spawn_scanner_thread(
-            channels.work_rx.clone(),
-            channels.dir_tx.clone(),
-            channels.result_tx.clone(),
-            Arc::clone(&pattern),
-            Arc::clone(&active_scanners),
+        let handle = spawn_scanner_thread(ScannerConfig {
+            work_rx: channels.work_rx.clone(),
+            dir_tx: channels.dir_tx.clone(),
+            result_tx: channels.result_tx.clone(),
+            pattern: Arc::clone(&pattern),
+            active_scanners: Arc::clone(&active_scanners),
             max_depth,
             symlink_mode,
-            root_path.clone(),
-        );
+            root_path: root_path.clone(),
+        });
         scanner_handles.push(handle);
     }
 
