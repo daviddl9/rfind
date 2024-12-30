@@ -3,10 +3,10 @@ use colored::*;
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use glob::Pattern;
 use log::debug;
+use parking_lot::Mutex;
 use pathdiff::diff_paths;
 use std::error::Error;
 use std::path::Path;
-use std::sync::Mutex;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -188,7 +188,7 @@ fn handle_symlink(
     // Check for symlink loops using canonical paths
     let canonical = path.canonicalize().ok();
     if let Some(canonical_path) = canonical {
-        let mut visited = ctx.visited_paths.lock().unwrap();
+        let mut visited = ctx.visited_paths.lock();
         if !visited.insert(canonical_path) {
             return Ok(false);
         }
