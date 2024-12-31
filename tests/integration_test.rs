@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader};
+use std::os::unix::fs::symlink;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use tempfile::TempDir;
@@ -42,8 +43,20 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
         fs::write(file_path, content)?;
     }
 
+    // Create symbolic links for testing -t l
+    let symlink_tests = [
+        ("dir1/link_to_test1.txt", "dir1/test1.txt"),
+        ("dir2/link_to_subdir1", "dir2/subdir1"),
+        ("dir3/link_to_test6.log", "dir3/subdir1/test6.log"),
+    ];
+
+    for (link_path, target_path) in symlink_tests.iter() {
+        symlink(base_path.join(target_path), base_path.join(link_path))?;
+    }
+
     // Test cases
     let test_cases = vec![
+        // Original test cases updated with type filter
         TestCase {
             pattern: "*.log",
             expected_files: vec!["test2.log", "test4.log", "test6.log"]
@@ -52,9 +65,24 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
                 .collect(),
             max_depth: None,
             threads: Some(1),
+            type_filter: Some("f"),
+            description: "Basic glob pattern for .log files (regular files only)",
         },
+        // Test case for both files and symlinks
         TestCase {
-            pattern: "test",
+            pattern: "*.log",
+            expected_files: vec!["test2.log", "test4.log", "test6.log", "link_to_test6.log"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            max_depth: None,
+            threads: Some(1),
+            type_filter: None,
+            description: "Find both .log files and symlinks to .log files",
+        },
+        // Type filter test cases - Files (-t f)
+        TestCase {
+            pattern: "test*",
             expected_files: vec![
                 "test1.txt",
                 "test2.log",
@@ -69,15 +97,56 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             .collect(),
             max_depth: None,
             threads: Some(1),
+            type_filter: Some("f"),
+            description: "Find only files with test* pattern",
         },
+        // Type filter test cases - Directories (-t d)
+        TestCase {
+            pattern: "sub*",
+            expected_files: vec!["subdir1", "subdir2", "subsubdir1"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            max_depth: None,
+            threads: Some(1),
+            type_filter: Some("d"),
+            description: "Find only directories with sub* pattern",
+        },
+        // Type filter test cases - Symlinks (-t l)
+        TestCase {
+            pattern: "link_*",
+            expected_files: vec!["link_to_test1.txt", "link_to_subdir1", "link_to_test6.log"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            max_depth: None,
+            threads: Some(1),
+            type_filter: Some("l"),
+            description: "Find only symbolic links with link_* pattern",
+        },
+        // Combined pattern and type filter tests
         TestCase {
             pattern: "*.txt",
-            expected_files: vec!["test1.txt", "test3.txt", "test5.txt"]
+            expected_files: vec!["test1.txt", "test3.txt", "test5.txt", "test7.txt"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            max_depth: None,
+            threads: Some(1),
+            type_filter: Some("f"),
+            description: "Find only .txt files, excluding symlinks to .txt files",
+        },
+        // Test with depth limit and type filter
+        TestCase {
+            pattern: "sub*",
+            expected_files: vec!["subdir1", "subdir2", "subsubdir1"]
                 .into_iter()
                 .map(String::from)
                 .collect(),
             max_depth: Some(2),
             threads: Some(1),
+            type_filter: Some("d"),
+            description: "Find directories with depth limit",
         },
     ];
 
@@ -89,7 +158,8 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
 
     // Run test cases
     for test_case in test_cases {
-        println!("\nRunning test case for pattern: {}", test_case.pattern);
+        println!("\nRunning test case: {}", test_case.description);
+        println!("Pattern: {}", test_case.pattern);
 
         let mut cmd = Command::new(&bin_path);
 
@@ -105,6 +175,10 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
 
         if let Some(threads) = test_case.threads {
             cmd.arg("--threads").arg(threads.to_string());
+        }
+
+        if let Some(type_filter) = test_case.type_filter {
+            cmd.arg("--type").arg(type_filter);
         }
 
         // Run the command
@@ -143,8 +217,9 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
 
         assert!(
             missing_files.is_empty() && unexpected_files.is_empty(),
-            "File mismatch for pattern '{}'\nMissing files: {:?}\nUnexpected files: {:?}",
+            "File mismatch for pattern '{}' with type filter '{:?}'\nMissing files: {:?}\nUnexpected files: {:?}",
             test_case.pattern,
+            test_case.type_filter,
             missing_files,
             unexpected_files
         );
@@ -158,4 +233,6 @@ struct TestCase {
     expected_files: HashSet<String>,
     max_depth: Option<usize>,
     threads: Option<usize>,
+    type_filter: Option<&'static str>,
+    description: &'static str,
 }
