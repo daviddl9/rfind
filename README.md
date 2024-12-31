@@ -1,11 +1,7 @@
-Below is an updated `README.md` with additional usage examples illustrating how to leverage the `-H`, `-L`, `-P`, and `-t` flags. It also includes a few small clarifications and improvements you might find useful.
-
----
-
 # 🚀 rfind
 [![CI](https://github.com/daviddl9/rfind/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/daviddl9/rfind/actions/workflows/ci.yml)
 
-A blazingly fast parallel recursive file finder that supports both glob patterns and substring search. It is a **supercharged** alternative to the classic [\*nix `find`](https://man7.org/linux/man-pages/man1/find.1.html) command, written in Rust.
+`rfind` (short for rocket find) is a blazingly fast parallel recursive file finder that supports both glob patterns and substring search. It is a supercharged alternative to the classic [\*nix `find`](https://man7.org/linux/man-pages/man1/find.1.html) command, written in Rust.
 
 ## ✨ Features
 
@@ -68,6 +64,8 @@ Options:
   ```
 
 ### Symbolic Link Handling
+
+The flags `-H`, `-L` and `-P` are similar to the implementation of the linux `find` command. 
 
 - **Never follow symlinks** (default: `-P`):  
   ```bash
@@ -150,7 +148,6 @@ rfind achieves its exceptional performance through:
   ```bash
   rfind "*.rs" | grep -v "/\."
   ```
-  A future enhancement might include a built-in `--ignore-hidden` flag.
 
 - **Excluding specific directories**: Similar to ignoring hidden files, you can pipe `rfind` results to `grep -v` for rudimentary exclusions:
   ```bash
