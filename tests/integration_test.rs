@@ -2,7 +2,10 @@ use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader};
+#[cfg(unix)]
 use std::os::unix::fs::symlink;
+#[cfg(windows)]
+use std::os::windows::fs::symlink_file as symlink;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use tempfile::TempDir;
