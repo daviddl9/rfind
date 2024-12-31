@@ -22,6 +22,32 @@ enum SymlinkMode {
     Always,  // -L: Follow all symlinks
 }
 
+/// Enum to filter results by type.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+enum TypeFilter {
+    #[default]
+    Any,
+    File,
+    Dir,
+    Symlink,
+}
+
+impl std::str::FromStr for TypeFilter {
+    type Err = String;
+
+    /// Converts user input to a `TypeFilter`.
+    /// Example: "-t f" => `TypeFilter::File`, "-t d" => `TypeFilter::Dir`, "-t l" => `TypeFilter::Symlink`.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "f" | "file" => Ok(TypeFilter::File),
+            "d" | "dir" => Ok(TypeFilter::Dir),
+            "l" | "link" | "symlink" => Ok(TypeFilter::Symlink),
+            "any" => Ok(TypeFilter::Any),
+            other => Err(format!("Invalid type filter '{}'. Use f|d|l|any.", other)),
+        }
+    }
+}
+
 /// Pattern matcher that supports both glob and fuzzy matching
 enum PatternMatcher {
     Glob(Pattern),
@@ -65,7 +91,7 @@ struct Args {
     max_depth: usize,
 
     /// Number of worker threads (defaults to number of CPU cores)
-    #[arg(short, long)]
+    #[arg(short = 'j', long)]
     threads: Option<usize>,
 
     /// Never follow symbolic links (default)
@@ -79,6 +105,11 @@ struct Args {
     /// Follow all symbolic links
     #[arg(short = 'L', long, group = "symlink_mode")]
     follow_all: bool,
+
+    /// Filter the results by type.
+    /// Possible values: f|file, d|dir, l|symlink, or any.
+    #[arg(short = 't', long = "type", default_value = "any")]
+    type_filter: TypeFilter,
 }
 
 impl Args {
@@ -100,6 +131,7 @@ struct ScannerContext {
     is_command_line: bool,                       // True for initial directory
     visited_paths: Arc<Mutex<HashSet<PathBuf>>>, // For loop detection
     root_path: PathBuf,
+    type_filter: TypeFilter,
 }
 
 fn normalize_path(path: &Path, root: &Path) -> PathBuf {
@@ -134,6 +166,17 @@ fn should_follow_symlink(ctx: &ScannerContext, is_command_path: bool) -> bool {
     }
 }
 
+/// Checks if the file/directory/symlink should be recorded as a match
+/// based on the --type / -t filter provided by the user.
+fn is_type_match(file_type: &std::fs::FileType, filter: TypeFilter) -> bool {
+    match filter {
+        TypeFilter::Any => true,
+        TypeFilter::File => file_type.is_file(),
+        TypeFilter::Dir => file_type.is_dir(),
+        TypeFilter::Symlink => file_type.is_symlink(),
+    }
+}
+
 fn handle_entry(
     entry: std::fs::DirEntry,
     ctx: &ScannerContext,
@@ -145,9 +188,11 @@ fn handle_entry(
     // Normalize the path relative to root
     let relative_path = normalize_path(&path, &ctx.root_path);
 
+    // Symlink handling
     if file_type.is_symlink() {
+        // If the filename matches our pattern, check if it also matches our --type filter
         if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-            if ctx.pattern.matches(file_name) {
+            if ctx.pattern.matches(file_name) && is_type_match(&file_type, ctx.type_filter) {
                 channels.result_tx.send(relative_path.clone())?;
             }
         }
@@ -159,11 +204,25 @@ fn handle_entry(
         return Ok(());
     }
 
+    // Directory
     if file_type.is_dir() {
-        handle_directory(path, ctx.work.depth, ctx, channels)?;
-    } else if file_type.is_file() {
+        // Always recurse into directories, even if --type=f
+        handle_directory(path.clone(), ctx.work.depth, ctx, channels)?;
+
+        // If user wants directories and the name matches our pattern, record it
+        if is_type_match(&file_type, ctx.type_filter) {
+            if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
+                if ctx.pattern.matches(dir_name) {
+                    channels.result_tx.send(relative_path)?;
+                }
+            }
+        }
+    }
+    // File
+    else if file_type.is_file() {
         if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-            if ctx.pattern.matches(file_name) {
+            // If filename matches pattern and type is file
+            if ctx.pattern.matches(file_name) && is_type_match(&file_type, ctx.type_filter) {
                 channels.result_tx.send(relative_path)?;
             }
         }
@@ -217,6 +276,7 @@ struct ScannerConfig {
     max_depth: usize,
     symlink_mode: SymlinkMode,
     root_path: PathBuf,
+    type_filter: TypeFilter,
 }
 
 fn spawn_scanner_thread(config: ScannerConfig) -> thread::JoinHandle<()> {
@@ -243,6 +303,7 @@ fn spawn_scanner_thread(config: ScannerConfig) -> thread::JoinHandle<()> {
                 is_command_line: work.depth == 0,
                 visited_paths: Arc::clone(&visited_paths),
                 root_path: config.root_path.clone(),
+                type_filter: config.type_filter,
             };
 
             // More defensive read_dir handling
@@ -347,6 +408,7 @@ fn setup_thread_pool(
     max_depth: usize,
     symlink_mode: SymlinkMode,
     root_path: PathBuf,
+    type_filter: TypeFilter,
 ) -> ThreadPool {
     let active_scanners = Arc::new(AtomicUsize::new(0));
     let mut scanner_handles = Vec::with_capacity(thread_count);
@@ -362,6 +424,7 @@ fn setup_thread_pool(
             max_depth,
             symlink_mode,
             root_path: root_path.clone(),
+            type_filter,
         });
         scanner_handles.push(handle);
     }
@@ -407,6 +470,7 @@ fn main() {
         args.max_depth,
         symlink_mode,
         root_path,
+        args.type_filter,
     );
 
     // Process results
