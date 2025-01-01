@@ -1,30 +1,72 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader};
-#[cfg(unix)]
-use std::os::unix::fs::symlink;
-#[cfg(windows)]
-use std::os::windows::fs::symlink_file as symlink;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use tempfile::TempDir;
 
+/// Represents a single integration test configuration
+struct TestCase {
+    pattern: &'static str,
+    /// List of (file_name, expected_count). For example:
+    ///   vec![("test6.log", 1), ("link_to_test6.log", 1)]
+    /// means we expect test6.log once and link_to_test6.log once.
+    expected_counts: Vec<(&'static str, usize)>,
+    max_depth: Option<usize>,
+    threads: Option<usize>,
+    /// "f", "d", "l", or "any" (or None to omit the --type arg)
+    type_filter: Option<&'static str>,
+    /// Symlink mode, e.g. Some("-H"), Some("-L"), or None (use default -P)
+    symlink_mode: Option<&'static str>,
+    description: &'static str,
+    /// If present, this path (relative to the `base_path`) will be used
+    /// for `--dir`; otherwise we use the default top-level fixture directory.
+    base_path_override: Option<&'static str>,
+}
+
+/// Convert a slice of (file_name, count) into a HashMap.
+fn make_expected_map(items: &[(&str, usize)]) -> HashMap<String, usize> {
+    let mut map = HashMap::new();
+    for (name, count) in items {
+        map.insert(name.to_string(), *count);
+    }
+    map
+}
+
+#[cfg(windows)]
+fn create_symlink(target: impl AsRef<Path>, link: impl AsRef<Path>, is_dir: bool) -> std::io::Result<()> {
+    if is_dir {
+        std::os::windows::fs::symlink_dir(target, link)
+    } else {
+        std::os::windows::fs::symlink_file(target, link)
+    }
+}
+
+#[cfg(unix)]
+fn create_symlink(target: impl AsRef<Path>, link: impl AsRef<Path>, _is_dir: bool) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+/// Example integration test
 #[test]
 fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
     // Create a temporary directory structure for testing
     let temp_dir = TempDir::new()?;
     let base_path = temp_dir.path();
 
-    // Create test directory structure
+    // Create directories
     let test_dirs = [
         "dir1/subdir1",
         "dir1/subdir2",
         "dir2/subdir1",
         "dir3/subdir1/subsubdir1",
     ];
+    for dir in test_dirs.iter() {
+        fs::create_dir_all(base_path.join(dir))?;
+    }
 
-    // Create test files
+    // Create files
     let test_files = [
         ("dir1/test1.txt", "content1"),
         ("dir1/subdir1/test2.log", "content2"),
@@ -34,208 +76,296 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
         ("dir3/subdir1/test6.log", "content6"),
         ("dir3/subdir1/subsubdir1/test7.txt", "content7"),
     ];
-
-    // Create directories
-    for dir in test_dirs.iter() {
-        fs::create_dir_all(base_path.join(dir))?;
-    }
-
-    // Create files
     for (path, content) in test_files.iter() {
-        let file_path = base_path.join(path);
-        fs::write(file_path, content)?;
+        fs::write(base_path.join(path), content)?;
     }
 
-    // Create symbolic links for testing -t l
+    // Create symbolic links
     let symlink_tests = [
-        ("dir1/link_to_test1.txt", "dir1/test1.txt"),
-        ("dir2/link_to_subdir1", "dir2/subdir1"),
-        ("dir3/link_to_test6.log", "dir3/subdir1/test6.log"),
+        // Link to a file
+        ("dir1/link_to_test1.txt", "dir1/test1.txt", false),
+        // Link to a directory
+        ("dir2/link_to_subdir1", "dir2/subdir1", true),
+        // Another link to a file
+        ("dir3/link_to_test6.log", "dir3/subdir1/test6.log", false),
     ];
-
-    for (link_path, target_path) in symlink_tests.iter() {
-        symlink(base_path.join(target_path), base_path.join(link_path))?;
+    for (link_path, target_path, is_dir) in symlink_tests.iter() {
+        create_symlink(base_path.join(target_path), base_path.join(link_path), *is_dir)?;
     }
 
+    //-----------------------------------------------------------------------
     // Test cases
+    //-----------------------------------------------------------------------
     let test_cases = vec![
-        // Original test cases updated with type filter
+        // -----------------------------------------------------------------
+        // Original examples (converted to expected_counts = 1 each)
+        // -----------------------------------------------------------------
         TestCase {
             pattern: "*.log",
-            expected_files: vec!["test2.log", "test4.log", "test6.log"]
-                .into_iter()
-                .map(String::from)
-                .collect(),
+            // Expect .log files only, ignoring symlinks
+            expected_counts: vec![
+                ("test2.log", 1),
+                ("test4.log", 1),
+                ("test6.log", 1),
+            ],
             max_depth: None,
             threads: Some(1),
-            type_filter: Some("f"),
+            type_filter: Some("f"), // only actual files
+            symlink_mode: None,     // default -P
             description: "Basic glob pattern for .log files (regular files only)",
+            base_path_override: None,
         },
-        // Test case for both files and symlinks
         TestCase {
             pattern: "*.log",
-            expected_files: vec!["test2.log", "test4.log", "test6.log", "link_to_test6.log"]
-                .into_iter()
-                .map(String::from)
-                .collect(),
+            // Expect logs AND the symlink to test6.log
+            expected_counts: vec![
+                ("test2.log", 1),
+                ("test4.log", 1),
+                ("test6.log", 1),
+                ("link_to_test6.log", 1),
+            ],
             max_depth: None,
             threads: Some(1),
-            type_filter: None,
-            description: "Find both .log files and symlinks to .log files",
+            type_filter: None, // default "any"
+            symlink_mode: None, 
+            description: "Find .log files plus any symlink that ends with .log",
+            base_path_override: None,
         },
-        // Type filter test cases - Files (-t f)
+        // Filter by type = f (only files)
         TestCase {
             pattern: "test*",
-            expected_files: vec![
-                "test1.txt",
-                "test2.log",
-                "test3.txt",
-                "test4.log",
-                "test5.txt",
-                "test6.log",
-                "test7.txt",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect(),
+            expected_counts: vec![
+                ("test1.txt", 1),
+                ("test2.log", 1),
+                ("test3.txt", 1),
+                ("test4.log", 1),
+                ("test5.txt", 1),
+                ("test6.log", 1),
+                ("test7.txt", 1),
+            ],
             max_depth: None,
             threads: Some(1),
             type_filter: Some("f"),
-            description: "Find only files with test* pattern",
+            symlink_mode: None,
+            description: "Find only files with 'test*' pattern",
+            base_path_override: None,
         },
-        // Type filter test cases - Directories (-t d)
+        // Filter by type = d (only dirs)
         TestCase {
             pattern: "sub*",
-            expected_files: vec!["subdir1", "subdir2", "subsubdir1"]
-                .into_iter()
-                .map(String::from)
-                .collect(),
+            expected_counts: vec![
+                ("subdir1", 3),
+                ("subdir2", 1),
+                ("subsubdir1", 1),
+            ],
             max_depth: None,
             threads: Some(1),
             type_filter: Some("d"),
-            description: "Find only directories with sub* pattern",
+            symlink_mode: None,
+            description: "Find only directories with 'sub*' pattern",
+            base_path_override: None,
         },
-        // Type filter test cases - Symlinks (-t l)
+        // Filter by type = l (only symlinks)
         TestCase {
             pattern: "link_*",
-            expected_files: vec!["link_to_test1.txt", "link_to_subdir1", "link_to_test6.log"]
-                .into_iter()
-                .map(String::from)
-                .collect(),
+            expected_counts: vec![
+                ("link_to_test1.txt", 1),
+                ("link_to_subdir1", 1),
+                ("link_to_test6.log", 1),
+            ],
             max_depth: None,
             threads: Some(1),
             type_filter: Some("l"),
-            description: "Find only symbolic links with link_* pattern",
+            symlink_mode: None,
+            description: "Find only symbolic links with 'link_*' pattern",
+            base_path_override: None,
         },
-        // Combined pattern and type filter tests
+        // Combined pattern + filter
         TestCase {
             pattern: "*.txt",
-            expected_files: vec!["test1.txt", "test3.txt", "test5.txt", "test7.txt"]
-                .into_iter()
-                .map(String::from)
-                .collect(),
+            expected_counts: vec![
+                ("test1.txt", 1),
+                ("test3.txt", 1),
+                ("test5.txt", 1),
+                ("test7.txt", 1),
+            ],
             max_depth: None,
             threads: Some(1),
             type_filter: Some("f"),
-            description: "Find only .txt files, excluding symlinks to .txt files",
+            symlink_mode: None,
+            description: "Find only .txt files (excluding symlink-to-txt)",
+            base_path_override: None,
         },
-        // Test with depth limit and type filter
+        // Depth limit
         TestCase {
             pattern: "sub*",
-            expected_files: vec!["subdir1", "subdir2", "subsubdir1"]
-                .into_iter()
-                .map(String::from)
-                .collect(),
+            expected_counts: vec![
+                ("subdir1", 3),
+                ("subdir2", 1),
+                ("subsubdir1", 1),
+            ],
             max_depth: Some(2),
             threads: Some(1),
             type_filter: Some("d"),
-            description: "Find directories with depth limit",
+            symlink_mode: None,
+            description: "Find only directories with sub* pattern (depth limit)",
+            base_path_override: None,
+        },
+        // 1) -L: Always follow symlinks
+        // Pattern matches "*test6.log", so it will match "test6.log" (real file)
+        // and "link_to_test6.log" (symlink). Since -L follows all symlinks,
+        // we expect to see them both.  Also, we see them anyway because
+        // the symlink name matches the pattern. But crucially, if there's
+        // a second route to the same file, we might see additional duplicates.
+        // Here, let's keep it simple: we expect at least these 2 appearances.
+        TestCase {
+            pattern: "*test6.log",
+            expected_counts: vec![
+                ("test6.log", 1),
+                ("link_to_test6.log", 1),
+            ],
+            max_depth: None,
+            threads: Some(1),
+            type_filter: None,
+            symlink_mode: Some("-L"), // follow all symlinks
+            description: "Always follow symlinks with -L; expect link + file for test6.log",
+            base_path_override: None,
+        },
+
+        // 2) -H: Follow symlinks only if they are on the command line
+        // In this example, we still pass the 'base_path' as the directory, so
+        // these symlinks are *discovered inside the recursion*, not on the CLI.
+        // That means for -H mode we do NOT follow them deeper. But we still see
+        // them *as symlinks themselves* if they match the pattern. We'll match
+        // "*test6.log" -> "link_to_test6.log" and the real "test6.log".
+        TestCase {
+            pattern: "*test6.log",
+            expected_counts: vec![
+                ("test6.log", 1),
+                ("link_to_test6.log", 1),
+            ],
+            max_depth: None,
+            threads: Some(1),
+            type_filter: None,
+            symlink_mode: Some("-H"),
+            description: "Follow symlinks only if on command line (-H). Here, they're discovered, so not followed, but still matched as symlinks.",
+            base_path_override: None,
+        },
+
+        // 3) An example to demonstrate that -H *does* follow symlink if used as the CLI dir:
+        // If you'd like to see -H in action, you can pass the symlinked directory as the root.
+        // For instance, "dir2/link_to_subdir1" is a link to "dir2/subdir1". We'll match "test5.txt".
+        // If we specify that symlink path as the root directory, then -H will expand it,
+        // whereas default -P wouldn't.
+        // This example forces an override of the directory under test.
+        TestCase {
+            pattern: "test5.txt",
+            // We only expect to see "test5.txt" once if -H actually enters that subdir.
+            // If we used -P with that symlink dir, we'd see zero results (it wouldn't
+            // follow the link).
+            expected_counts: vec![
+                ("test5.txt", 1),
+            ],
+            max_depth: None,
+            threads: Some(1),
+            type_filter: None,
+            symlink_mode: Some("-H"),
+            description: "Follow symlink if it's the command line root (-H). Expect test5.txt once.",
+            base_path_override: Some("dir2/link_to_subdir1"),
         },
     ];
 
-    // Get the path to the compiled binary
+    // Path to our compiled test binary (e.g. "rfind")
     let mut bin_path = env::current_exe()?;
-    bin_path.pop(); // Remove the test executable name
-    bin_path.pop(); // Remove 'deps' directory
-    bin_path.push("rfind"); // Add the actual binary name
+    bin_path.pop(); // remove "test_file_finder_integration" binary
+    bin_path.pop(); // remove "deps"
+    bin_path.push("rfind"); // the actual finder binary
 
-    // Run test cases
     for test_case in test_cases {
         println!("\nRunning test case: {}", test_case.description);
         println!("Pattern: {}", test_case.pattern);
 
+        // Construct the command
         let mut cmd = Command::new(&bin_path);
 
-        cmd.arg(&test_case.pattern)
+        // Decide which directory to scan:
+        // if base_path_override is present, join it to base_path.
+        // Otherwise, use the default base_path from the TempDir.
+        let base_dir = if let Some(rel_path) = test_case.base_path_override {
+            base_path.join(rel_path)
+        } else {
+            base_path.to_path_buf()
+        };
+
+        cmd.arg(test_case.pattern)
             .arg("--dir")
-            .arg(base_path)
+            .arg(base_dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
         if let Some(depth) = test_case.max_depth {
             cmd.arg("--max-depth").arg(depth.to_string());
         }
-
         if let Some(threads) = test_case.threads {
             cmd.arg("--threads").arg(threads.to_string());
         }
-
-        if let Some(type_filter) = test_case.type_filter {
-            cmd.arg("--type").arg(type_filter);
+        if let Some(tfilter) = test_case.type_filter {
+            cmd.arg("--type").arg(tfilter);
+        }
+        if let Some(symlink_flag) = test_case.symlink_mode {
+            // e.g. -H or -L
+            cmd.arg(symlink_flag);
         }
 
-        // Run the command
+        // Spawn the child process
         let mut child = cmd.spawn()?;
 
-        // Create a set to store found files
-        let mut found_files = HashSet::new();
+        // We'll store each discovered filename in a Map<filename, count>.
+        let mut found_counts: HashMap<String, usize> = HashMap::new();
 
         // Read stdout line by line
         if let Some(stdout) = child.stdout.take() {
             let reader = BufReader::new(stdout);
-            for line in reader.lines() {
-                let line = line?;
-                if let Some(file_name) =
-                    Path::new(&line.trim()).file_name().and_then(|n| n.to_str())
+            for line_result in reader.lines() {
+                let line = line_result?;
+                // Trim it and parse out the file_name
+                if let Some(file_name) = Path::new(line.trim()).file_name().and_then(|n| n.to_str())
                 {
-                    found_files.insert(String::from(file_name));
+                    *found_counts.entry(file_name.to_string()).or_insert(0) += 1;
                 }
             }
         }
 
-        // Wait for the process to complete
+        // Wait for the process
         let status = child.wait()?;
         assert!(status.success(), "Process failed with status: {}", status);
 
-        // Print debug information
-        println!("Expected files: {:?}", test_case.expected_files);
-        println!("Found files: {:?}", found_files);
+        // Compare found_counts to expected_counts
+        let expected_map = make_expected_map(&test_case.expected_counts);
 
-        // Check for missing files
-        let missing_files: HashSet<_> = test_case.expected_files.difference(&found_files).collect();
+        println!("  Expected: {:?}", expected_map);
+        println!("  Found:    {:?}", found_counts);
 
-        // Check for unexpected files
-        let unexpected_files: HashSet<_> =
-            found_files.difference(&test_case.expected_files).collect();
+        // Check each expected item
+        for (expected_file, &expected_count) in &expected_map {
+            let actual_count = found_counts.get(expected_file).copied().unwrap_or(0);
+            assert_eq!(
+                actual_count, expected_count,
+                "Mismatch in counts for '{}': expected {}, found {}",
+                expected_file, expected_count, actual_count
+            );
+        }
 
-        assert!(
-            missing_files.is_empty() && unexpected_files.is_empty(),
-            "File mismatch for pattern '{}' with type filter '{:?}'\nMissing files: {:?}\nUnexpected files: {:?}",
-            test_case.pattern,
-            test_case.type_filter,
-            missing_files,
-            unexpected_files
-        );
+        // Also check for any extra items we did not expect
+        for (found_file, &count) in &found_counts {
+            if !expected_map.contains_key(found_file) && count > 0 {
+                panic!(
+                    "Found unexpected file '{}' with count {} in test '{}'",
+                    found_file, count, test_case.description
+                );
+            }
+        }
     }
 
     Ok(())
-}
-
-struct TestCase {
-    pattern: &'static str,
-    expected_files: HashSet<String>,
-    max_depth: Option<usize>,
-    threads: Option<usize>,
-    type_filter: Option<&'static str>,
-    description: &'static str,
 }
