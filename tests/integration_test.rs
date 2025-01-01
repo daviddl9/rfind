@@ -24,6 +24,9 @@ struct TestCase {
     /// Symlink mode, e.g. Some("-H"), Some("-L"), or None (use default -P)
     symlink_mode: Option<&'static str>,
     description: &'static str,
+    /// If present, this path (relative to the `base_path`) will be used
+    /// for `--dir`; otherwise we use the default top-level fixture directory.
+    base_path_override: Option<&'static str>,
 }
 
 /// Convert a slice of (file_name, count) into a HashMap.
@@ -100,6 +103,7 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             type_filter: Some("f"), // only actual files
             symlink_mode: None,     // default -P
             description: "Basic glob pattern for .log files (regular files only)",
+            base_path_override: None,
         },
         TestCase {
             pattern: "*.log",
@@ -115,6 +119,7 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             type_filter: None, // default "any"
             symlink_mode: None, 
             description: "Find .log files plus any symlink that ends with .log",
+            base_path_override: None,
         },
         // Filter by type = f (only files)
         TestCase {
@@ -133,6 +138,7 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             type_filter: Some("f"),
             symlink_mode: None,
             description: "Find only files with 'test*' pattern",
+            base_path_override: None,
         },
         // Filter by type = d (only dirs)
         TestCase {
@@ -147,6 +153,7 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             type_filter: Some("d"),
             symlink_mode: None,
             description: "Find only directories with 'sub*' pattern",
+            base_path_override: None,
         },
         // Filter by type = l (only symlinks)
         TestCase {
@@ -161,6 +168,7 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             type_filter: Some("l"),
             symlink_mode: None,
             description: "Find only symbolic links with 'link_*' pattern",
+            base_path_override: None,
         },
         // Combined pattern + filter
         TestCase {
@@ -176,6 +184,7 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             type_filter: Some("f"),
             symlink_mode: None,
             description: "Find only .txt files (excluding symlink-to-txt)",
+            base_path_override: None,
         },
         // Depth limit
         TestCase {
@@ -190,12 +199,8 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             type_filter: Some("d"),
             symlink_mode: None,
             description: "Find only directories with sub* pattern (depth limit)",
+            base_path_override: None,
         },
-
-        // -----------------------------------------------------------------
-        // NEW: tests for symlink modes -H (command line) and -L (always)
-        // -----------------------------------------------------------------
-
         // 1) -L: Always follow symlinks
         // Pattern matches "*test6.log", so it will match "test6.log" (real file)
         // and "link_to_test6.log" (symlink). Since -L follows all symlinks,
@@ -214,6 +219,7 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             type_filter: None,
             symlink_mode: Some("-L"), // follow all symlinks
             description: "Always follow symlinks with -L; expect link + file for test6.log",
+            base_path_override: None,
         },
 
         // 2) -H: Follow symlinks only if they are on the command line
@@ -222,9 +228,6 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
         // That means for -H mode we do NOT follow them deeper. But we still see
         // them *as symlinks themselves* if they match the pattern. We'll match
         // "*test6.log" -> "link_to_test6.log" and the real "test6.log".
-        // So ironically, we will still see 2 lines here (the file and the symlink).
-        // If you truly wanted to see the difference vs. -L, you'd create a link
-        // to a directory that leads to more files, etc.
         TestCase {
             pattern: "*test6.log",
             expected_counts: vec![
@@ -236,6 +239,7 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             type_filter: None,
             symlink_mode: Some("-H"),
             description: "Follow symlinks only if on command line (-H). Here, they're discovered, so not followed, but still matched as symlinks.",
+            base_path_override: None,
         },
 
         // 3) An example to demonstrate that -H *does* follow symlink if used as the CLI dir:
@@ -257,6 +261,7 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             type_filter: None,
             symlink_mode: Some("-H"),
             description: "Follow symlink if it's the command line root (-H). Expect test5.txt once.",
+            base_path_override: Some("dir2/link_to_subdir1"),
         },
     ];
 
@@ -273,21 +278,18 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
         // Construct the command
         let mut cmd = Command::new(&bin_path);
 
+        // Decide which directory to scan:
+        // if base_path_override is present, join it to base_path.
+        // Otherwise, use the default base_path from the TempDir.
+        let base_dir = if let Some(rel_path) = test_case.base_path_override {
+            base_path.join(rel_path)
+        } else {
+            base_path.to_path_buf()
+        };
+
         cmd.arg(test_case.pattern)
             .arg("--dir")
-            .arg({
-                // If you want an actual example of calling a symlinked dir as root,
-                // you'd do something like:
-                //   base_path.join("dir2").join("link_to_subdir1")
-                // But for simplicity, we’ll do `base_path` for all except our 3rd symlink test.
-                if test_case.description.contains("Follow symlink if it's the command line root") {
-                    // Force scanning from the symlinked directory
-                    base_path.join("dir2").join("link_to_subdir1")
-                } else {
-                    // Default to scanning from the base fixture
-                    base_path.to_path_buf()
-                }
-            })
+            .arg(base_dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
