@@ -3,6 +3,7 @@ use colored::*;
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use glob::Pattern;
 use log::debug;
+use memchr::memmem::FinderBuilder; // Uses Boyer-Moore-Horspool algorithm for substring search
 use parking_lot::Mutex;
 use pathdiff::diff_paths;
 use std::error::Error;
@@ -49,18 +50,21 @@ impl std::str::FromStr for TypeFilter {
     }
 }
 
-/// Pattern matcher that supports both glob and substring (fuzzy) matching
 enum PatternMatcher {
     Glob(Pattern),
-    Substring { pattern_lower: String },
+    Substring { pattern_bytes: Box<[u8]> },
 }
 
 impl PatternMatcher {
     fn matches(&self, filename: &str) -> bool {
         match self {
             PatternMatcher::Glob(pattern) => pattern.matches(filename),
-            PatternMatcher::Substring { pattern_lower } => {
-                filename.to_lowercase().contains(pattern_lower)
+            PatternMatcher::Substring { pattern_bytes, .. } => {
+                let filename_lower = filename.to_lowercase();
+                FinderBuilder::new()
+                    .build_forward(pattern_bytes)
+                    .find(filename_lower.as_bytes())
+                    .is_some()
             }
         }
     }
@@ -70,9 +74,10 @@ fn create_pattern_matcher(pattern: &str) -> PatternMatcher {
     if pattern.contains('*') || pattern.contains('?') {
         PatternMatcher::Glob(Pattern::new(pattern).expect("Invalid glob pattern"))
     } else {
-        PatternMatcher::Substring {
-            pattern_lower: pattern.to_lowercase(),
-        }
+        let pattern_lower = pattern.to_lowercase();
+        let pattern_bytes = pattern_lower.as_bytes().to_vec().into_boxed_slice();
+
+        PatternMatcher::Substring { pattern_bytes }
     }
 }
 
