@@ -6,6 +6,7 @@ use log::debug;
 use parking_lot::Mutex;
 use pathdiff::diff_paths;
 use std::error::Error;
+use std::io::Write;
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -48,7 +49,7 @@ impl std::str::FromStr for TypeFilter {
     }
 }
 
-/// Pattern matcher that supports both glob and fuzzy matching
+/// Pattern matcher that supports both glob and substring (fuzzy) matching
 enum PatternMatcher {
     Glob(Pattern),
     Substring { pattern_lower: String },
@@ -74,6 +75,7 @@ fn create_pattern_matcher(pattern: &str) -> PatternMatcher {
         }
     }
 }
+
 /// Parallel recursive file finder
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -110,6 +112,11 @@ struct Args {
     /// Possible values: f|file, d|dir, l|symlink, or any.
     #[arg(short = 't', long = "type", default_value = "any")]
     type_filter: TypeFilter,
+
+    /// Print each matching path followed by a null character ('\0')
+    /// instead of a newline, similar to "find -print0".
+    #[arg(long = "print0")]
+    print0: bool,
 }
 
 impl Args {
@@ -135,9 +142,16 @@ struct ScannerContext {
 }
 
 fn normalize_path(path: &Path, root: &Path) -> PathBuf {
-    let root_parent = root.parent().unwrap_or_else(|| Path::new(""));
-    // This will maintain the root directory name in the path
-    diff_paths(path, root_parent).unwrap_or_else(|| path.to_path_buf())
+    let relative = diff_paths(path, root).unwrap_or_else(|| path.to_path_buf());
+    // Prepend a "/" to make it easier to pipe to other commands
+    PathBuf::from("/").join(relative)
+}
+
+/// Represents a work unit for directory scanning
+#[derive(Debug, Clone)]
+struct WorkUnit {
+    path: PathBuf,
+    depth: usize,
 }
 
 struct ScannerChannels {
@@ -327,13 +341,6 @@ fn spawn_scanner_thread(config: ScannerConfig) -> thread::JoinHandle<()> {
     })
 }
 
-/// Represents a work unit for directory scanning
-#[derive(Debug, Clone)]
-struct WorkUnit {
-    path: PathBuf,
-    depth: usize,
-}
-
 struct ThreadPool {
     scanner_handles: Vec<thread::JoinHandle<()>>,
     distributor_handle: thread::JoinHandle<()>,
@@ -451,14 +458,17 @@ fn main() {
 
     let channels = create_channels(thread_count);
 
-    // Get the canonical path of the root directory's parent
-    let root_path = std::fs::canonicalize(&args.dir).unwrap_or_else(|_| args.dir.clone());
+    // Keep original path for normalization
+    let root_path = args.dir.clone();
 
-    // Submit initial work unit with the full path
+    // Use canonicalized path for actual filesystem operations
+    let work_path = std::fs::canonicalize(&args.dir).unwrap_or_else(|_| args.dir.clone());
+
+    // Submit initial work unit with the canonicalized path
     channels
         .work_tx
         .send(WorkUnit {
-            path: root_path.clone(),
+            path: work_path,
             depth: 0,
         })
         .expect("Failed to send initial work");
@@ -469,13 +479,18 @@ fn main() {
         channels,
         args.max_depth,
         symlink_mode,
-        root_path,
+        root_path, // Use original path for normalization
         args.type_filter,
     );
 
     // Process results
     while let Ok(path) = thread_pool.result_receiver.recv() {
-        println!("{}", format!("{}", path.display()).green());
+        if args.print0 {
+            print!("{}\0", path.display());
+            std::io::stdout().flush().expect("Failed to flush stdout");
+        } else {
+            println!("{}", format!("{}", path.display()).green());
+        }
     }
 
     // Wait for all threads to complete
