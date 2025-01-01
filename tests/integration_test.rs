@@ -2,10 +2,6 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader};
-#[cfg(unix)]
-use std::os::unix::fs::symlink;
-#[cfg(windows)]
-use std::os::windows::fs::symlink_file as symlink;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use tempfile::TempDir;
@@ -36,6 +32,20 @@ fn make_expected_map(items: &[(&str, usize)]) -> HashMap<String, usize> {
         map.insert(name.to_string(), *count);
     }
     map
+}
+
+#[cfg(windows)]
+fn create_symlink(target: impl AsRef<Path>, link: impl AsRef<Path>, is_dir: bool) -> std::io::Result<()> {
+    if is_dir {
+        std::os::windows::fs::symlink_dir(target, link)
+    } else {
+        std::os::windows::fs::symlink_file(target, link)
+    }
+}
+
+#[cfg(unix)]
+fn create_symlink(target: impl AsRef<Path>, link: impl AsRef<Path>, _is_dir: bool) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
 }
 
 /// Example integration test
@@ -73,14 +83,14 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
     // Create symbolic links
     let symlink_tests = [
         // Link to a file
-        ("dir1/link_to_test1.txt", "dir1/test1.txt"),
+        ("dir1/link_to_test1.txt", "dir1/test1.txt", false),
         // Link to a directory
-        ("dir2/link_to_subdir1", "dir2/subdir1"),
+        ("dir2/link_to_subdir1", "dir2/subdir1", true),
         // Another link to a file
-        ("dir3/link_to_test6.log", "dir3/subdir1/test6.log"),
+        ("dir3/link_to_test6.log", "dir3/subdir1/test6.log", false),
     ];
-    for (link_path, target_path) in symlink_tests.iter() {
-        symlink(base_path.join(target_path), base_path.join(link_path))?;
+    for (link_path, target_path, is_dir) in symlink_tests.iter() {
+        create_symlink(base_path.join(target_path), base_path.join(link_path), *is_dir)?;
     }
 
     //-----------------------------------------------------------------------
