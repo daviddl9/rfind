@@ -39,6 +39,7 @@ Options:
   -H, --cmd-follow             Follow symbolic links on command line only
   -L, --follow-all             Follow all symbolic links
   -t, --type <TYPE_FILTER>     Filter the results by type. Possible values: f|file, d|dir, l|symlink, or any [default: any]
+  --print0                     Print each matching path followed by a null character ('\0') instead of a newline
   -h, --help                   Print help
   -V, --version                Print version
 ```
@@ -113,6 +114,18 @@ Use `-t` (or `--type`) to filter results by file type:
   rfind -t any "*test*"
   ```
   Shows both files, directories, and symlinks that have "test" in their name.
+
+### Using `--print0` with `xargs -0`
+
+When `--print0` is specified, rfind outputs each matching path followed by a null character (`'\0'`) instead of a newline. This is especially useful when filenames may contain spaces, newlines, or other special characters, allowing you to safely pass them to tools like `xargs -0`:
+
+```bash
+rfind --print0 "*.txt" -d . | xargs -0 grep "some_pattern"
+```
+
+In this example:
+* `--print0` ensures that files are delimited by a null character.
+* `xargs -0` then safely processes the null-delimited filenames, preventing unwanted splitting.
 
 ## 🔧 Installation
 
