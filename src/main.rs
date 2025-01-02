@@ -14,7 +14,85 @@ use std::sync::{
     Arc,
 };
 use std::thread;
+use std::time::{Duration, SystemTime};
 use std::{collections::HashSet, path::PathBuf};
+
+/// Represents a time comparison operation
+#[derive(Debug, Clone, Copy)]
+enum TimeComparison {
+    Exactly, // n
+    Lesser,  // -n
+    Greater, // +n
+}
+
+/// Represents a time unit for comparison
+#[derive(Debug, Clone, Copy)]
+enum TimeUnit {
+    Minutes,
+    Days,
+}
+
+/// Holds time-based filter configuration
+#[derive(Debug, Clone)]
+struct TimeFilter {
+    comparison: TimeComparison,
+    value: i64,
+    unit: TimeUnit,
+}
+
+impl TimeFilter {
+    /// Parse a time filter string in the format: [+-]N[md]
+    /// Examples: "+1d" (more than 1 day), "-2m" (less than 2 minutes), "3d" (exactly 3 days)
+    fn parse(s: &str) -> Result<Self, String> {
+        let (comparison, rest) = match s.chars().next() {
+            Some('+') => (TimeComparison::Greater, &s[1..]),
+            Some('-') => (TimeComparison::Lesser, &s[1..]),
+            Some(_) => (TimeComparison::Exactly, s),
+            None => return Err("Empty time filter".to_string()),
+        };
+
+        let unit = match rest.chars().last() {
+            Some('m') => TimeUnit::Minutes,
+            Some('d') => TimeUnit::Days,
+            _ => return Err("Invalid time unit. Use 'm' for minutes or 'd' for days".to_string()),
+        };
+
+        let value_str = &rest[..rest.len() - 1];
+        let value = value_str
+            .parse::<i64>()
+            .map_err(|_| "Invalid number in time filter".to_string())?;
+
+        Ok(TimeFilter {
+            comparison,
+            value,
+            unit,
+        })
+    }
+
+    /// Convert the time filter value to a Duration
+    fn to_duration(&self) -> Duration {
+        match self.unit {
+            TimeUnit::Minutes => Duration::from_secs(self.value.unsigned_abs() * 60),
+            TimeUnit::Days => Duration::from_secs(self.value.unsigned_abs() * 24 * 60 * 60),
+        }
+    }
+
+    /// Check if a file's modification time matches the filter
+    fn matches(&self, mtime: SystemTime, now: SystemTime) -> bool {
+        let duration = self.to_duration();
+        let age = now.duration_since(mtime).unwrap_or(Duration::ZERO);
+
+        match self.comparison {
+            TimeComparison::Exactly => {
+                let lower = duration.saturating_sub(Duration::from_secs(60));
+                let upper = duration + Duration::from_secs(60);
+                age >= lower && age <= upper
+            }
+            TimeComparison::Lesser => age < duration,
+            TimeComparison::Greater => age > duration,
+        }
+    }
+}
 
 #[derive(Default, Debug, Clone, Copy)]
 enum SymlinkMode {
@@ -122,6 +200,19 @@ struct Args {
     /// instead of a newline, similar to "find -print0".
     #[arg(long = "print0")]
     print0: bool,
+
+    /// Filter by modification time (format: [+-]N[md])
+    /// Examples: +1d (more than 1 day), -2m (less than 2 minutes), 3d (exactly 3 days)
+    #[arg(long = "mtime")]
+    mtime: Option<String>,
+
+    /// Filter by access time (format: [+-]N[md])
+    #[arg(long = "atime")]
+    atime: Option<String>,
+
+    /// Filter by change time (format: [+-]N[md])
+    #[arg(long = "ctime")]
+    ctime: Option<String>,
 }
 
 impl Args {
@@ -144,6 +235,10 @@ struct ScannerContext {
     visited_paths: Arc<Mutex<HashSet<PathBuf>>>, // For loop detection
     root_path: PathBuf,
     type_filter: TypeFilter,
+    mtime_filter: Option<TimeFilter>,
+    atime_filter: Option<TimeFilter>,
+    ctime_filter: Option<TimeFilter>,
+    now: SystemTime,
 }
 
 fn normalize_path(path: &Path, root: &Path) -> PathBuf {
@@ -187,13 +282,51 @@ fn should_follow_symlink(ctx: &ScannerContext, is_command_path: bool) -> bool {
 
 /// Checks if the file/directory/symlink should be recorded as a match
 /// based on the --type / -t filter provided by the user.
-fn is_type_match(file_type: &std::fs::FileType, filter: TypeFilter) -> bool {
-    match filter {
+fn is_type_match(metadata: &std::fs::Metadata, filter: TypeFilter, ctx: &ScannerContext) -> bool {
+    let file_type = metadata.file_type();
+    let base_match = match filter {
         TypeFilter::Any => true,
         TypeFilter::File => file_type.is_file(),
         TypeFilter::Dir => file_type.is_dir(),
         TypeFilter::Symlink => file_type.is_symlink(),
+    };
+
+    if !base_match {
+        return false;
     }
+
+    // Apply time filters
+    if let Some(mtime_filter) = &ctx.mtime_filter {
+        if !mtime_filter.matches(metadata.modified().unwrap_or(ctx.now), ctx.now) {
+            return false;
+        }
+    }
+
+    if let Some(atime_filter) = &ctx.atime_filter {
+        if !atime_filter.matches(metadata.accessed().unwrap_or(ctx.now), ctx.now) {
+            return false;
+        }
+    }
+
+    if let Some(ctime_filter) = &ctx.ctime_filter {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let ctime = SystemTime::UNIX_EPOCH + Duration::from_secs(metadata.ctime() as u64);
+            if !ctime_filter.matches(ctime, ctx.now) {
+                return false;
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            // Fall back to mtime on non-Unix systems
+            if !ctime_filter.matches(metadata.modified().unwrap_or(ctx.now), ctx.now) {
+                return false;
+            }
+        }
+    }
+
+    true
 }
 
 fn handle_entry(
@@ -202,21 +335,20 @@ fn handle_entry(
     channels: &ScannerChannels,
 ) -> Result<(), Box<dyn Error>> {
     let path = entry.path();
-    let file_type = entry.file_type()?;
+    let metadata = entry.metadata()?;
 
     // Normalize the path relative to root
     let relative_path = normalize_path(&path, &ctx.root_path);
 
     // Symlink handling
-    if file_type.is_symlink() {
-        // If the filename matches our pattern, check if it also matches our --type filter
+    if metadata.file_type().is_symlink() {
         if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-            if ctx.pattern.matches(file_name) && is_type_match(&file_type, ctx.type_filter) {
+            if ctx.pattern.matches(file_name) && is_type_match(&metadata, ctx.type_filter, ctx) {
                 channels.result_tx.send(relative_path.clone())?;
             }
         }
 
-        match handle_symlink(&path, file_type, ctx, channels) {
+        match handle_symlink(&path, metadata.file_type(), ctx, channels) {
             Ok(_) => (),
             Err(e) => debug!("Error handling symlink {:?}: {}", path, e),
         }
@@ -224,12 +356,10 @@ fn handle_entry(
     }
 
     // Directory
-    if file_type.is_dir() {
-        // Always recurse into directories, even if --type=f
+    if metadata.file_type().is_dir() {
         handle_directory(path.clone(), ctx.work.depth, ctx, channels)?;
 
-        // If user wants directories and the name matches our pattern, record it
-        if is_type_match(&file_type, ctx.type_filter) {
+        if is_type_match(&metadata, ctx.type_filter, ctx) {
             if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
                 if ctx.pattern.matches(dir_name) {
                     channels.result_tx.send(relative_path)?;
@@ -238,10 +368,9 @@ fn handle_entry(
         }
     }
     // File
-    else if file_type.is_file() {
+    else if metadata.file_type().is_file() {
         if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-            // If filename matches pattern and type is file
-            if ctx.pattern.matches(file_name) && is_type_match(&file_type, ctx.type_filter) {
+            if ctx.pattern.matches(file_name) && is_type_match(&metadata, ctx.type_filter, ctx) {
                 channels.result_tx.send(relative_path)?;
             }
         }
@@ -296,6 +425,10 @@ struct ScannerConfig {
     symlink_mode: SymlinkMode,
     root_path: PathBuf,
     type_filter: TypeFilter,
+    mtime_filter: Option<TimeFilter>,
+    atime_filter: Option<TimeFilter>,
+    ctime_filter: Option<TimeFilter>,
+    now: SystemTime,
 }
 
 fn spawn_scanner_thread(config: ScannerConfig) -> thread::JoinHandle<()> {
@@ -323,6 +456,10 @@ fn spawn_scanner_thread(config: ScannerConfig) -> thread::JoinHandle<()> {
                 visited_paths: Arc::clone(&visited_paths),
                 root_path: config.root_path.clone(),
                 type_filter: config.type_filter,
+                mtime_filter: config.mtime_filter.clone(),
+                atime_filter: config.atime_filter.clone(),
+                ctime_filter: config.ctime_filter.clone(),
+                now: config.now,
             };
 
             // More defensive read_dir handling
@@ -413,7 +550,7 @@ fn spawn_work_distributor(
     })
 }
 
-fn setup_thread_pool(
+struct ThreadPoolOptions {
     thread_count: usize,
     pattern: Arc<PatternMatcher>,
     channels: ChannelSet,
@@ -421,42 +558,83 @@ fn setup_thread_pool(
     symlink_mode: SymlinkMode,
     root_path: PathBuf,
     type_filter: TypeFilter,
-) -> ThreadPool {
+    mtime_filter: Option<TimeFilter>,
+    atime_filter: Option<TimeFilter>,
+    ctime_filter: Option<TimeFilter>,
+    now: SystemTime,
+}
+
+fn setup_thread_pool(pool_options: ThreadPoolOptions) -> ThreadPool {
     let active_scanners = Arc::new(AtomicUsize::new(0));
-    let mut scanner_handles = Vec::with_capacity(thread_count);
+    let mut scanner_handles = Vec::with_capacity(pool_options.thread_count);
 
     // Spawn scanner threads
-    for _ in 0..thread_count {
+    for _ in 0..pool_options.thread_count {
         let handle = spawn_scanner_thread(ScannerConfig {
-            work_rx: channels.work_rx.clone(),
-            dir_tx: channels.dir_tx.clone(),
-            result_tx: channels.result_tx.clone(),
-            pattern: Arc::clone(&pattern),
+            work_rx: pool_options.channels.work_rx.clone(),
+            dir_tx: pool_options.channels.dir_tx.clone(),
+            result_tx: pool_options.channels.result_tx.clone(),
+            pattern: Arc::clone(&pool_options.pattern),
             active_scanners: Arc::clone(&active_scanners),
-            max_depth,
-            symlink_mode,
-            root_path: root_path.clone(),
-            type_filter,
+            max_depth: pool_options.max_depth,
+            symlink_mode: pool_options.symlink_mode,
+            root_path: pool_options.root_path.clone(),
+            type_filter: pool_options.type_filter,
+            mtime_filter: pool_options.mtime_filter.clone(),
+            atime_filter: pool_options.atime_filter.clone(),
+            ctime_filter: pool_options.ctime_filter.clone(),
+            now: pool_options.now,
         });
         scanner_handles.push(handle);
     }
 
     // Spawn work distributor
     let distributor_handle = spawn_work_distributor(
-        channels.work_tx.clone(),
-        channels.dir_rx,
+        pool_options.channels.work_tx.clone(),
+        pool_options.channels.dir_rx,
         Arc::clone(&active_scanners),
     );
 
     ThreadPool {
         scanner_handles,
         distributor_handle,
-        result_receiver: channels.result_rx,
+        result_receiver: pool_options.channels.result_rx,
     }
 }
 
 fn main() {
     let args = Args::parse();
+
+    // Parse time filters
+    let mtime_filter = args
+        .mtime
+        .as_deref()
+        .map(TimeFilter::parse)
+        .transpose()
+        .unwrap_or_else(|e| {
+            eprintln!("Invalid mtime filter: {}", e);
+            std::process::exit(1);
+        });
+
+    let atime_filter = args
+        .atime
+        .as_deref()
+        .map(TimeFilter::parse)
+        .transpose()
+        .unwrap_or_else(|e| {
+            eprintln!("Invalid atime filter: {}", e);
+            std::process::exit(1);
+        });
+
+    let ctime_filter = args
+        .ctime
+        .as_deref()
+        .map(TimeFilter::parse)
+        .transpose()
+        .unwrap_or_else(|e| {
+            eprintln!("Invalid ctime filter: {}", e);
+            std::process::exit(1);
+        });
     let pattern = Arc::new(create_pattern_matcher(&args.pattern));
     let thread_count = args.threads.unwrap_or_else(num_cpus::get);
     let symlink_mode = args.symlink_mode();
@@ -478,15 +656,19 @@ fn main() {
         })
         .expect("Failed to send initial work");
 
-    let thread_pool = setup_thread_pool(
+    let thread_pool = setup_thread_pool(ThreadPoolOptions {
         thread_count,
         pattern,
         channels,
-        args.max_depth,
+        max_depth: args.max_depth,
         symlink_mode,
-        root_path, // Use original path for normalization
-        args.type_filter,
-    );
+        root_path,
+        type_filter: args.type_filter,
+        mtime_filter,
+        atime_filter,
+        ctime_filter,
+        now: SystemTime::now(),
+    });
 
     // Process results
     while let Ok(path) = thread_pool.result_receiver.recv() {
