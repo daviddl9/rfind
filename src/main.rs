@@ -43,8 +43,8 @@ struct TimeFilter {
 }
 
 impl TimeFilter {
-    /// Parse a time filter string in the format: [+-]N[md]
-    /// Examples: "+1d" (more than 1 day), "-2m" (less than 2 minutes), "3d" (exactly 3 days)
+    /// Parse a time filter string in the format: [+-]N[smhd]
+    /// Examples: "+1h" (more than 1 hour), "-2m" (less than 2 minutes), "3d" (about 3 days back)
     fn parse(s: &str) -> Result<Self, String> {
         let (comparison, rest) = match s.chars().next() {
             Some('+') => (TimeComparison::Greater, &s[1..]),
@@ -90,8 +90,14 @@ impl TimeFilter {
 
         match self.comparison {
             TimeComparison::Exactly => {
-                let lower = duration.saturating_sub(Duration::from_secs(60));
-                let upper = duration + Duration::from_secs(60);
+                let tolerance = match self.unit {
+                    TimeUnit::Seconds => Duration::from_secs(2), // ±2 second
+                    TimeUnit::Minutes => Duration::from_secs(30), // ±30 seconds
+                    TimeUnit::Hours => Duration::from_secs(60 * 30), // ±30 minutes
+                    TimeUnit::Days => Duration::from_secs(60 * 60 * 12), // ±12 hours
+                };
+                let lower = duration.saturating_sub(tolerance);
+                let upper = duration.saturating_add(tolerance);
                 age >= lower && age <= upper
             }
             TimeComparison::Lesser => age < duration,
@@ -207,16 +213,16 @@ struct Args {
     #[arg(long = "print0")]
     print0: bool,
 
-    /// Filter by modification time (format: [+-]N[md])
-    /// Examples: +1d (more than 1 day), -2m (less than 2 minutes), 3d (exactly 3 days)
+    /// Filter by modification time (format: [+-]N[smhd])
+    /// Examples: +1d (more than 1 day), -2m (less than 2 minutes), 3d (exactly 3 days), +1h (more than 1 hour), -45s (less than 45 seconds)
     #[arg(long = "mtime", allow_hyphen_values = true)]
     mtime: Option<String>,
 
-    /// Filter by access time (format: [+-]N[md])
+    /// Filter by access time (format: [+-]N[smhd])
     #[arg(long = "atime", allow_hyphen_values = true)]
     atime: Option<String>,
 
-    /// Filter by change time (format: [+-]N[md])
+    /// Filter by change time (format: [+-]N[smhd])
     #[arg(long = "ctime", allow_hyphen_values = true)]
     ctime: Option<String>,
 }

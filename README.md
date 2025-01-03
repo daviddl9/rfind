@@ -69,9 +69,9 @@ Options:
   -L, --follow-all             Follow all symbolic links
   -t, --type <TYPE_FILTER>     Filter the results by type. Possible values: f|file, d|dir, l|symlink, or any [default: any]
       --print0                 Print each matching path followed by a null character ('\0') instead of a newline, similar to "find -print0"
-      --mtime <MTIME>          Filter by modification time (format: [+-]N[md]) Examples: +1d (more than 1 day), -2m (less than 2 minutes), 3d (exactly 3 days)
-      --atime <ATIME>          Filter by access time (format: [+-]N[md])
-      --ctime <CTIME>          Filter by change time (format: [+-]N[md])
+      --mtime <MTIME>          Filter by modification time (format: [+-]N[smhd]) Examples: +1d (more than 1 day), -2m (less than 2 minutes), 3d (exactly 3 days), +1h (more than 1 hour), -45s (less than 45 seconds)
+      --atime <ATIME>          Filter by access time (format: [+-]N[smhd])
+      --ctime <CTIME>          Filter by change time (format: [+-]N[smhd])
   -h, --help                   Print help
   -V, --version                Print version
 ```
