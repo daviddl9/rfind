@@ -29,6 +29,7 @@ enum TimeComparison {
 #[derive(Debug, Clone, Copy)]
 enum TimeUnit {
     Minutes,
+    Hours,
     Days,
 }
 
@@ -54,6 +55,7 @@ impl TimeFilter {
         let unit = match rest.chars().last() {
             Some('m') => TimeUnit::Minutes,
             Some('d') => TimeUnit::Days,
+            Some('h') => TimeUnit::Hours,
             _ => return Err("Invalid time unit. Use 'm' for minutes or 'd' for days".to_string()),
         };
 
@@ -73,14 +75,15 @@ impl TimeFilter {
     fn to_duration(&self) -> Duration {
         match self.unit {
             TimeUnit::Minutes => Duration::from_secs(self.value.unsigned_abs() * 60),
+            TimeUnit::Hours => Duration::from_secs(self.value.unsigned_abs() * 60 * 60),
             TimeUnit::Days => Duration::from_secs(self.value.unsigned_abs() * 24 * 60 * 60),
         }
     }
 
     /// Check if a file's modification time matches the filter
-    fn matches(&self, mtime: SystemTime, now: SystemTime) -> bool {
+    fn matches(&self, file_time: SystemTime, now: SystemTime) -> bool {
         let duration = self.to_duration();
-        let age = now.duration_since(mtime).unwrap_or(Duration::ZERO);
+        let age = now.duration_since(file_time).unwrap_or(Duration::ZERO);
 
         match self.comparison {
             TimeComparison::Exactly => {
@@ -242,26 +245,14 @@ struct ScannerContext {
 }
 
 fn normalize_path(path: &Path, root: &Path) -> PathBuf {
-    if let Ok(_root_canonical) = root.canonicalize() {
-        if let Ok(path_canonical) = path.canonicalize() {
-            // If we can canonicalize both paths, use the full canonical path
-            return path_canonical;
-        }
-    }
-
-    // Fallback: if canonicalization fails, try to compose the path
     if let Some(relative) = diff_paths(path, root) {
-        // Join the canonicalized root (or original root if canonicalization fails)
-        // with the relative path
-        root.canonicalize()
-            .unwrap_or_else(|_| root.to_path_buf())
-            .join(relative)
+        // Always use the root path and join with relative to preserve symlink paths
+        root.to_path_buf().join(relative)
     } else {
         // If diff_paths fails, return the original path
         path.to_path_buf()
     }
 }
-
 /// Represents a work unit for directory scanning
 #[derive(Debug, Clone)]
 struct WorkUnit {
@@ -447,7 +438,7 @@ struct ScannerConfig {
 }
 
 fn spawn_scanner_thread(config: ScannerConfig) -> thread::JoinHandle<()> {
-    let visited_paths = Arc::new(Mutex::new(HashSet::new()));
+    let visited_paths = Arc::new(Mutex::new(HashSet::with_capacity(1000)));
 
     thread::spawn(move || {
         let channels = ScannerChannels {

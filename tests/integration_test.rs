@@ -39,25 +39,6 @@ struct TimeTestFile {
     atime_offset: i64,
 }
 
-/// Helper function to set file timestamps relative to a base time
-fn set_file_times(path: &Path, base_time: SystemTime, mtime_offset: i64, atime_offset: i64) -> std::io::Result<()> {
-    let to_filetime = |offset: i64| -> FileTime {
-        let timestamp = if offset < 0 {
-            base_time.checked_sub(Duration::from_secs(offset.unsigned_abs() * 60))
-                .unwrap_or(SystemTime::UNIX_EPOCH)
-        } else {
-            base_time.checked_add(Duration::from_secs(offset as u64 * 60))
-                .unwrap_or(SystemTime::now())
-        };
-        FileTime::from_system_time(timestamp)
-    };
-
-    let mtime = to_filetime(mtime_offset);
-    let atime = to_filetime(atime_offset);
-    
-    filetime::set_file_times(path, atime, mtime)
-}
-
 #[test]
 fn test_file_finder_time_filters() -> Result<(), Box<dyn std::error::Error>> {
     // Create a temporary directory structure for testing
@@ -67,28 +48,28 @@ fn test_file_finder_time_filters() -> Result<(), Box<dyn std::error::Error>> {
     // Create test directories
     fs::create_dir_all(base_path.join("time_test"))?;
     
-    // Base time for our tests (2 hours ago)
-    let base_time = SystemTime::now() - Duration::from_secs(2 * 60 * 60);
+    // Use current time as base
+    let now = SystemTime::now();
     
-    // Define test files with specific timestamps
+    // Define test files with specific timestamps relative to now
     let test_files = vec![
         TimeTestFile {
             path: "time_test/recent.txt".into(),
             content: "recent file",
-            mtime_offset: -5,    // 5 minutes ago
-            atime_offset: -3,    // 3 minutes ago
+            mtime_offset: -5,     // 5 minutes ago (should match -10m)
+            atime_offset: -3,     // 3 minutes ago
         },
         TimeTestFile {
             path: "time_test/hour_old.txt".into(),
             content: "hour old file",
-            mtime_offset: -60,   // 1 hour ago
-            atime_offset: -30,   // 30 minutes ago
+            mtime_offset: -60,    // 1 hour ago
+            atime_offset: -30,    // 30 minutes ago
         },
         TimeTestFile {
             path: "time_test/day_old.txt".into(),
-            content: "day old file",
-            mtime_offset: -1440, // 24 hours ago
-            atime_offset: -720,  // 12 hours ago
+            content: "old file",
+            mtime_offset: -180,   // 3 hours ago
+            atime_offset: -120,   // 2 hours ago
         },
     ];
 
@@ -96,12 +77,25 @@ fn test_file_finder_time_filters() -> Result<(), Box<dyn std::error::Error>> {
     for file in &test_files {
         let file_path = base_path.join(&file.path);
         fs::write(&file_path, file.content)?;
-        set_file_times(
+        
+        // Calculate timestamp relative to now
+        let mtime = now - Duration::from_secs(file.mtime_offset.unsigned_abs() * 60);
+        let atime = now - Duration::from_secs(file.atime_offset.unsigned_abs() * 60);
+        
+        filetime::set_file_times(
             &file_path,
-            base_time,
-            file.mtime_offset,
-            file.atime_offset,
+            FileTime::from_system_time(atime),
+            FileTime::from_system_time(mtime),
         )?;
+
+        // Debug: Print actual timestamps and their ages
+        let metadata = fs::metadata(&file_path)?;
+        let actual_mtime = metadata.modified()?;
+        let age = now.duration_since(actual_mtime)
+            .map(|d| format!("{:.0} minutes", d.as_secs() as f64 / 60.0))
+            .unwrap_or_else(|_| "error".to_string());
+        
+        println!("File: {} (age: {})", file.path, age);
     }
 
     // Path to our compiled test binary
@@ -194,6 +188,7 @@ fn test_file_finder_time_filters() -> Result<(), Box<dyn std::error::Error>> {
             expected_counts: vec![
                 ("recent.txt", 1),
                 ("hour_old.txt", 1),
+                ("day_old.txt", 1),
             ],
             max_depth: None,
             threads: Some(1),
