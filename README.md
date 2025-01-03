@@ -21,6 +21,35 @@ In benchmarks on large directory structures (1M+ files), rfind consistently outp
 * 📁 Deep nested structures: Up to 12x performance improvement  
 * 💾 SSD optimization: Maximizes I/O throughput with parallel workers  
 
+## 🔧 Installation
+
+1. **Install [Rust](https://www.rust-lang.org/tools/install)** (stable or newer).  
+2. Clone this repository:
+
+   ```bash
+   git clone https://github.com/daviddl9/rfind.git
+   cd rfind
+   ```
+
+3. **Build and install**:
+
+   ```bash
+   cargo build --release
+   cargo install --path .
+   ```
+   This places the `rfind` binary in your Cargo bin directory (e.g. `~/.cargo/bin`).
+
+## ⚡ How It Works
+
+rfind achieves its exceptional performance through:
+
+- Multi-threaded directory traversal  
+- Efficient work distribution using crossbeam channels  
+- Smart memory management with pre-allocated buffers  
+- Zero-copy string matching  
+- Adaptive thread pooling  
+
+
 ## 🛠️ Usage
 
 ```bash
@@ -39,7 +68,10 @@ Options:
   -H, --cmd-follow             Follow symbolic links on command line only
   -L, --follow-all             Follow all symbolic links
   -t, --type <TYPE_FILTER>     Filter the results by type. Possible values: f|file, d|dir, l|symlink, or any [default: any]
-  --print0                     Print each matching path followed by a null character ('\0') instead of a newline
+      --print0                 Print each matching path followed by a null character ('\0') instead of a newline, similar to "find -print0"
+      --mtime <MTIME>          Filter by modification time (format: [+-]N[md]) Examples: +1d (more than 1 day), -2m (less than 2 minutes), 3d (exactly 3 days)
+      --atime <ATIME>          Filter by access time (format: [+-]N[md])
+      --ctime <CTIME>          Filter by change time (format: [+-]N[md])
   -h, --help                   Print help
   -V, --version                Print version
 ```
@@ -127,35 +159,66 @@ In this example:
 * `--print0` ensures that files are delimited by a null character.
 * `xargs -0` then safely processes the null-delimited filenames, preventing unwanted splitting.
 
-## 🔧 Installation
+### Time-Based Filtering
 
-1. **Install [Rust](https://www.rust-lang.org/tools/install)** (stable or newer).  
-2. Clone this repository:
+Use `--mtime`, `--atime`, and `--ctime` to filter files based on their timestamps. The format is `[+-]N[md]` where:
+- `N` is a number
+- `m` for minutes, `d` for days
+- `+` means "older than N"
+- `-` means "newer than N"
+- No prefix means "exactly N"
 
-   ```bash
-   git clone https://github.com/daviddl9/rfind.git
-   cd rfind
-   ```
+#### Examples with modification time (`--mtime`):
 
-3. **Build and install**:
+- **Files modified less than 30 minutes ago:**
+  ```bash
+  rfind "*.log" --mtime -30m
+  ```
 
-   ```bash
-   cargo build --release
-   cargo install --path .
-   ```
-   This places the `rfind` binary in your Cargo bin directory (e.g. `~/.cargo/bin`).
+- **Files modified more than 7 days ago:**
+  ```bash
+  rfind "*" --mtime +7d
+  ```
 
-## ⚡ How It Works
+- **Files modified exactly 1 day ago** (within a 1-minute margin):
+  ```bash
+  rfind "*" --mtime 1d
+  ```
 
-rfind achieves its exceptional performance through:
+#### Examples with access time (`--atime`):
 
-- Multi-threaded directory traversal  
-- Efficient work distribution using crossbeam channels  
-- Smart memory management with pre-allocated buffers  
-- Zero-copy string matching  
-- Adaptive thread pooling  
+- **Files accessed in the last hour:**
+  ```bash
+  rfind "*" --atime -60m
+  ```
 
-## Additional Suggestions
+- **Configuration files not accessed in 30 days:**
+  ```bash
+  rfind "*.conf" --atime +30d
+  ```
+
+#### Examples with change time (`--ctime`):
+
+- **Files whose metadata changed in the last 10 minutes:**
+  ```bash
+  rfind "*" --ctime -10m
+  ```
+
+#### Combining Time Filters:
+
+You can combine multiple time filters to create more specific searches:
+
+- **Log files modified in the last day but not accessed in the last hour:**
+  ```bash
+  rfind "*.log" --mtime -1d --atime +60m
+  ```
+
+- **Configuration files changed recently but with old content:**
+  ```bash
+  rfind "*.conf" --ctime -30m --mtime +7d
+  ```
+
+## 💡 Additional Suggestions
 
 - **Avoiding hidden files or directories**: Currently, `rfind` doesn’t provide a built-in flag to ignore `.*` entries. For now, you can combine `rfind` with standard shell utilities like `grep` or `sed` to filter results if you need to exclude hidden files:
   ```bash
