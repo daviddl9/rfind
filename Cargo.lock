@@ -924,6 +924,7 @@ dependencies = [
  "ctrlc",
  "directories-next",
  "env_logger",
+ "filetime",
  "glob",
  "humansize",
  "indicatif",

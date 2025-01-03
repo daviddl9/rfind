@@ -5,6 +5,8 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use tempfile::TempDir;
+use filetime::*;
+use std::time::{SystemTime, Duration};
 
 /// Represents a single integration test configuration
 struct TestCase {
@@ -23,6 +25,288 @@ struct TestCase {
     /// If present, this path (relative to the `base_path`) will be used
     /// for `--dir`; otherwise we use the default top-level fixture directory.
     base_path_override: Option<&'static str>,
+    mtime: Option<&'static str>,
+    atime: Option<&'static str>,
+    ctime: Option<&'static str>,
+}
+
+/// Helper struct to manage test file timestamps
+struct TimeTestFile {
+    path: String,
+    content: &'static str,
+    /// Offset in minutes from test start time
+    mtime_offset: i64,
+    atime_offset: i64,
+}
+
+#[test]
+fn test_file_finder_time_filters() -> Result<(), Box<dyn std::error::Error>> {
+    // Create a temporary directory structure for testing
+    let temp_dir = TempDir::new()?;
+    let base_path = temp_dir.path();
+
+    // Create test directories
+    fs::create_dir_all(base_path.join("time_test"))?;
+    
+    // Use current time as base
+    let now = SystemTime::now();
+    
+    // Define test files with specific timestamps relative to now
+    let test_files = vec![
+        TimeTestFile {
+            path: "time_test/recent.txt".into(),
+            content: "recent file",
+            mtime_offset: -5,     // 5 minutes ago (should match -10m)
+            atime_offset: -3,     // 3 minutes ago
+        },
+        TimeTestFile {
+            path: "time_test/hour_old.txt".into(),
+            content: "hour old file",
+            mtime_offset: -60,    // 1 hour ago
+            atime_offset: -30,    // 30 minutes ago
+        },
+        TimeTestFile {
+            path: "time_test/day_old.txt".into(),
+            content: "old file",
+            mtime_offset: -180,   // 3 hours ago
+            atime_offset: -120,   // 2 hours ago
+        },
+    ];
+
+    // Create files and set their timestamps
+    for file in &test_files {
+        let file_path = base_path.join(&file.path);
+        fs::write(&file_path, file.content)?;
+        
+        // Calculate timestamp relative to now
+        let mtime = now - Duration::from_secs(file.mtime_offset.unsigned_abs() * 60);
+        let atime = now - Duration::from_secs(file.atime_offset.unsigned_abs() * 60);
+        
+        filetime::set_file_times(
+            &file_path,
+            FileTime::from_system_time(atime),
+            FileTime::from_system_time(mtime),
+        )?;
+
+        // Debug: Print actual timestamps and their ages
+        let metadata = fs::metadata(&file_path)?;
+        let actual_mtime = metadata.modified()?;
+        let age = now.duration_since(actual_mtime)
+            .map(|d| format!("{:.0} minutes", d.as_secs() as f64 / 60.0))
+            .unwrap_or_else(|_| "error".to_string());
+        
+        println!("File: {} (age: {})", file.path, age);
+    }
+
+    // Path to our compiled test binary
+    let mut bin_path = env::current_exe()?;
+    bin_path.pop(); // remove test binary name
+    bin_path.pop(); // remove "deps"
+    bin_path.push("rfind");
+
+    // Time-based test cases
+    let time_test_cases = vec![
+        TestCase {
+            pattern: "*.txt",
+            expected_counts: vec![
+                ("recent.txt", 1),
+            ],
+            max_depth: None,
+            threads: Some(1),
+            type_filter: Some("f"),
+            symlink_mode: None,
+            mtime: Some("-10m"),    // Less than 10 minutes old
+            atime: None,
+            ctime: None,
+            description: "Find files modified less than 10 minutes ago",
+            base_path_override: Some("time_test"),
+        },
+        TestCase {
+            pattern: "*.txt",
+            expected_counts: vec![
+                ("hour_old.txt", 1),
+                ("day_old.txt", 1),
+            ],
+            max_depth: None,
+            threads: Some(1),
+            type_filter: Some("f"),
+            symlink_mode: None,
+            mtime: Some("+30m"),    // More than 30 minutes old
+            atime: None,
+            ctime: None,
+            description: "Find files modified more than 30 minutes ago",
+            base_path_override: Some("time_test"),
+        },
+        TestCase {
+            pattern: "*.txt",
+            expected_counts: vec![
+                ("hour_old.txt", 1),
+            ],
+            max_depth: None,
+            threads: Some(1),
+            type_filter: Some("f"),
+            symlink_mode: None,
+            mtime: Some("1h"),      // Exactly 1 hour old (within 1-minute margin)
+            atime: None,
+            ctime: None,
+            description: "Find files modified exactly 1 hour ago",
+            base_path_override: Some("time_test"),
+        },
+        TestCase {
+            pattern: "*.txt",
+            expected_counts: vec![
+                ("recent.txt", 1),
+            ],
+            max_depth: None,
+            threads: Some(1),
+            type_filter: Some("f"),
+            symlink_mode: None,
+            mtime: None,
+            atime: Some("-5m"),     // Accessed less than 5 minutes ago
+            ctime: None,
+            description: "Find files accessed less than 5 minutes ago",
+            base_path_override: Some("time_test"),
+        },
+        TestCase {
+            pattern: "*.txt",
+            expected_counts: vec![
+                ("hour_old.txt", 1),
+            ],
+            max_depth: None,
+            threads: Some(1),
+            type_filter: Some("f"),
+            symlink_mode: None,
+            mtime: Some("+30m"),    // Modified more than 30 minutes ago
+            atime: Some("-60m"),    // Accessed less than 60 minutes ago
+            ctime: None,
+            description: "Find files with combined modification and access time filters",
+            base_path_override: Some("time_test"),
+        },
+        #[cfg(unix)]
+        TestCase {
+            pattern: "*.txt",
+            expected_counts: vec![
+                ("recent.txt", 1),
+                ("hour_old.txt", 1),
+                ("day_old.txt", 1),
+            ],
+            max_depth: None,
+            threads: Some(1),
+            type_filter: Some("f"),
+            symlink_mode: None,
+            mtime: None,
+            atime: None,
+            ctime: Some("-120m"),   // Changed less than 2 hours ago
+            description: "Find files changed less than 2 hours ago (Unix only)",
+            base_path_override: Some("time_test"),
+        },
+    ];
+
+    // Execute each test case
+    for test_case in time_test_cases {
+        println!("\nRunning time filter test case: {}", test_case.description);
+        println!("Pattern: {}", test_case.pattern);
+
+        // Build command
+        let mut cmd = Command::new(&bin_path);
+        
+        let base_dir = if let Some(rel_path) = test_case.base_path_override {
+            base_path.join(rel_path)
+        } else {
+            base_path.to_path_buf()
+        };
+
+        // Basic arguments
+        cmd.arg(test_case.pattern)
+            .arg("--dir")
+            .arg(&base_dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        // Optional arguments
+        if let Some(depth) = test_case.max_depth {
+            cmd.arg("--max-depth").arg(depth.to_string());
+        }
+        if let Some(threads) = test_case.threads {
+            cmd.arg("--threads").arg(threads.to_string());
+        }
+        if let Some(tfilter) = test_case.type_filter {
+            cmd.arg("--type").arg(tfilter);
+        }
+        if let Some(symlink_flag) = test_case.symlink_mode {
+            cmd.arg(symlink_flag);
+        }
+
+        // Time-based filters
+        if let Some(mtime) = test_case.mtime {
+            cmd.arg("--mtime").arg(mtime);
+            println!("  With mtime filter: {}", mtime);
+        }
+        if let Some(atime) = test_case.atime {
+            cmd.arg("--atime").arg(atime);
+            println!("  With atime filter: {}", atime);
+        }
+        if let Some(ctime) = test_case.ctime {
+            cmd.arg("--ctime").arg(ctime);
+            println!("  With ctime filter: {}", ctime);
+        }
+
+        // Run command and collect results
+        let mut child = cmd.spawn()?;
+        let mut found_counts: HashMap<String, usize> = HashMap::new();
+
+        if let Some(stdout) = child.stdout.take() {
+            let reader = BufReader::new(stdout);
+            for line_result in reader.lines() {
+                let line = line_result?;
+                if let Some(file_name) = Path::new(line.trim()).file_name().and_then(|n| n.to_str()) {
+                    *found_counts.entry(file_name.to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+
+        // Check process status
+        let status = child.wait()?;
+        if !status.success() {
+            let mut error_message = String::new();
+            if let Some(mut stderr) = child.stderr.take() {
+                std::io::Read::read_to_string(&mut stderr, &mut error_message)?;
+            }
+            return Err(format!(
+                "Process failed in test '{}' with status: {}. Stderr: {}",
+                test_case.description, status, error_message
+            ).into());
+        }
+
+        // Verify results
+        let expected_map = make_expected_map(&test_case.expected_counts);
+        println!("  Expected counts: {:?}", expected_map);
+        println!("  Found counts:    {:?}", found_counts);
+
+        // Check for expected files
+        for (expected_file, &expected_count) in &expected_map {
+            let actual_count = found_counts.get(expected_file).copied().unwrap_or(0);
+            assert_eq!(
+                actual_count, expected_count,
+                "Test '{}': Mismatch for file '{}' - expected {} occurrences, found {}",
+                test_case.description, expected_file, expected_count, actual_count
+            );
+        }
+
+        // Check for unexpected files
+        for (found_file, &count) in &found_counts {
+            if !expected_map.contains_key(found_file.as_str()) && count > 0 {
+                return Err(format!(
+                    "Test '{}': Found unexpected file '{}' with count {}",
+                    test_case.description, found_file, count
+                ).into());
+            }
+        }
+
+        println!("  ✓ Test passed: {}", test_case.description);
+    }
+
+    Ok(())
 }
 
 /// Convert a slice of (file_name, count) into a HashMap.
@@ -114,6 +398,9 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             symlink_mode: None,     // default -P
             description: "Basic glob pattern for .log files (regular files only)",
             base_path_override: None,
+            atime: None,
+            ctime: None,
+            mtime: None,
         },
         TestCase {
             pattern: "*.log",
@@ -130,6 +417,9 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             symlink_mode: None, 
             description: "Find .log files plus any symlink that ends with .log",
             base_path_override: None,
+            atime: None,
+            ctime: None,
+            mtime: None,
         },
         // Filter by type = f (only files)
         TestCase {
@@ -149,6 +439,9 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             symlink_mode: None,
             description: "Find only files with 'test*' pattern",
             base_path_override: None,
+            atime: None,
+            ctime: None,
+            mtime: None,
         },
         // Filter by type = d (only dirs)
         TestCase {
@@ -164,6 +457,9 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             symlink_mode: None,
             description: "Find only directories with 'sub*' pattern",
             base_path_override: None,
+            atime: None,
+            ctime: None,
+            mtime: None,
         },
         // Filter by type = l (only symlinks)
         TestCase {
@@ -179,6 +475,9 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             symlink_mode: None,
             description: "Find only symbolic links with 'link_*' pattern",
             base_path_override: None,
+            atime: None,
+            ctime: None,
+            mtime: None,
         },
         // Combined pattern + filter
         TestCase {
@@ -195,6 +494,9 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             symlink_mode: None,
             description: "Find only .txt files (excluding symlink-to-txt)",
             base_path_override: None,
+            atime: None,
+            ctime: None,
+            mtime: None,
         },
         // Depth limit
         TestCase {
@@ -210,6 +512,9 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             symlink_mode: None,
             description: "Find only directories with sub* pattern (depth limit)",
             base_path_override: None,
+            atime: None,
+            ctime: None,
+            mtime: None,
         },
         // 1) -L: Always follow symlinks
         // Pattern matches "*test6.log", so it will match "test6.log" (real file)
@@ -230,6 +535,9 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             symlink_mode: Some("-L"), // follow all symlinks
             description: "Always follow symlinks with -L; expect link + file for test6.log",
             base_path_override: None,
+            atime: None,
+            ctime: None,
+            mtime: None,
         },
 
         // 2) -H: Follow symlinks only if they are on the command line
@@ -250,6 +558,9 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             symlink_mode: Some("-H"),
             description: "Follow symlinks only if on command line (-H). Here, they're discovered, so not followed, but still matched as symlinks.",
             base_path_override: None,
+            atime: None,
+            ctime: None,
+            mtime: None,
         },
 
         // 3) An example to demonstrate that -H *does* follow symlink if used as the CLI dir:
@@ -272,6 +583,9 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             symlink_mode: Some("-H"),
             description: "Follow symlink if it's the command line root (-H). Expect test5.txt once.",
             base_path_override: Some("dir2/link_to_subdir1"),
+            atime: None,
+            ctime: None,
+            mtime: None,
         },
     ];
 
