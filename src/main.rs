@@ -203,15 +203,15 @@ struct Args {
 
     /// Filter by modification time (format: [+-]N[md])
     /// Examples: +1d (more than 1 day), -2m (less than 2 minutes), 3d (exactly 3 days)
-    #[arg(long = "mtime")]
+    #[arg(long = "mtime", allow_hyphen_values = true)]
     mtime: Option<String>,
 
     /// Filter by access time (format: [+-]N[md])
-    #[arg(long = "atime")]
+    #[arg(long = "atime", allow_hyphen_values = true)]
     atime: Option<String>,
 
     /// Filter by change time (format: [+-]N[md])
-    #[arg(long = "ctime")]
+    #[arg(long = "ctime", allow_hyphen_values = true)]
     ctime: Option<String>,
 }
 
@@ -242,9 +242,24 @@ struct ScannerContext {
 }
 
 fn normalize_path(path: &Path, root: &Path) -> PathBuf {
-    let relative = diff_paths(path, root).unwrap_or_else(|| path.to_path_buf());
-    // Prepend a "/" to make it easier to pipe to other commands
-    PathBuf::from("/").join(relative)
+    if let Ok(_root_canonical) = root.canonicalize() {
+        if let Ok(path_canonical) = path.canonicalize() {
+            // If we can canonicalize both paths, use the full canonical path
+            return path_canonical;
+        }
+    }
+
+    // Fallback: if canonicalization fails, try to compose the path
+    if let Some(relative) = diff_paths(path, root) {
+        // Join the canonicalized root (or original root if canonicalization fails)
+        // with the relative path
+        root.canonicalize()
+            .unwrap_or_else(|_| root.to_path_buf())
+            .join(relative)
+    } else {
+        // If diff_paths fails, return the original path
+        path.to_path_buf()
+    }
 }
 
 /// Represents a work unit for directory scanning

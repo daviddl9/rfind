@@ -42,8 +42,14 @@ struct TimeTestFile {
 /// Helper function to set file timestamps relative to a base time
 fn set_file_times(path: &Path, base_time: SystemTime, mtime_offset: i64, atime_offset: i64) -> std::io::Result<()> {
     let to_filetime = |offset: i64| -> FileTime {
-        let adjusted = base_time + Duration::from_secs((offset * 60) as u64);
-        FileTime::from_system_time(adjusted)
+        let timestamp = if offset < 0 {
+            base_time.checked_sub(Duration::from_secs(offset.unsigned_abs() * 60))
+                .unwrap_or(SystemTime::UNIX_EPOCH)
+        } else {
+            base_time.checked_add(Duration::from_secs(offset as u64 * 60))
+                .unwrap_or(SystemTime::now())
+        };
+        FileTime::from_system_time(timestamp)
     };
 
     let mtime = to_filetime(mtime_offset);
@@ -397,6 +403,9 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             symlink_mode: None,     // default -P
             description: "Basic glob pattern for .log files (regular files only)",
             base_path_override: None,
+            atime: None,
+            ctime: None,
+            mtime: None,
         },
         TestCase {
             pattern: "*.log",
@@ -413,6 +422,9 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             symlink_mode: None, 
             description: "Find .log files plus any symlink that ends with .log",
             base_path_override: None,
+            atime: None,
+            ctime: None,
+            mtime: None,
         },
         // Filter by type = f (only files)
         TestCase {
@@ -432,6 +444,9 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             symlink_mode: None,
             description: "Find only files with 'test*' pattern",
             base_path_override: None,
+            atime: None,
+            ctime: None,
+            mtime: None,
         },
         // Filter by type = d (only dirs)
         TestCase {
@@ -447,6 +462,9 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             symlink_mode: None,
             description: "Find only directories with 'sub*' pattern",
             base_path_override: None,
+            atime: None,
+            ctime: None,
+            mtime: None,
         },
         // Filter by type = l (only symlinks)
         TestCase {
@@ -462,6 +480,9 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             symlink_mode: None,
             description: "Find only symbolic links with 'link_*' pattern",
             base_path_override: None,
+            atime: None,
+            ctime: None,
+            mtime: None,
         },
         // Combined pattern + filter
         TestCase {
@@ -478,6 +499,9 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             symlink_mode: None,
             description: "Find only .txt files (excluding symlink-to-txt)",
             base_path_override: None,
+            atime: None,
+            ctime: None,
+            mtime: None,
         },
         // Depth limit
         TestCase {
@@ -493,6 +517,9 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             symlink_mode: None,
             description: "Find only directories with sub* pattern (depth limit)",
             base_path_override: None,
+            atime: None,
+            ctime: None,
+            mtime: None,
         },
         // 1) -L: Always follow symlinks
         // Pattern matches "*test6.log", so it will match "test6.log" (real file)
@@ -513,6 +540,9 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             symlink_mode: Some("-L"), // follow all symlinks
             description: "Always follow symlinks with -L; expect link + file for test6.log",
             base_path_override: None,
+            atime: None,
+            ctime: None,
+            mtime: None,
         },
 
         // 2) -H: Follow symlinks only if they are on the command line
@@ -533,6 +563,9 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             symlink_mode: Some("-H"),
             description: "Follow symlinks only if on command line (-H). Here, they're discovered, so not followed, but still matched as symlinks.",
             base_path_override: None,
+            atime: None,
+            ctime: None,
+            mtime: None,
         },
 
         // 3) An example to demonstrate that -H *does* follow symlink if used as the CLI dir:
@@ -555,6 +588,9 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             symlink_mode: Some("-H"),
             description: "Follow symlink if it's the command line root (-H). Expect test5.txt once.",
             base_path_override: Some("dir2/link_to_subdir1"),
+            atime: None,
+            ctime: None,
+            mtime: None,
         },
     ];
 
