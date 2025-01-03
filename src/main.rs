@@ -28,6 +28,7 @@ enum TimeComparison {
 /// Represents a time unit for comparison
 #[derive(Debug, Clone, Copy)]
 enum TimeUnit {
+    Seconds,
     Minutes,
     Hours,
     Days,
@@ -53,6 +54,7 @@ impl TimeFilter {
         };
 
         let unit = match rest.chars().last() {
+            Some('s') => TimeUnit::Seconds,
             Some('m') => TimeUnit::Minutes,
             Some('d') => TimeUnit::Days,
             Some('h') => TimeUnit::Hours,
@@ -74,6 +76,7 @@ impl TimeFilter {
     /// Convert the time filter value to a Duration
     fn to_duration(&self) -> Duration {
         match self.unit {
+            TimeUnit::Seconds => Duration::from_secs(self.value.unsigned_abs()),
             TimeUnit::Minutes => Duration::from_secs(self.value.unsigned_abs() * 60),
             TimeUnit::Hours => Duration::from_secs(self.value.unsigned_abs() * 60 * 60),
             TimeUnit::Days => Duration::from_secs(self.value.unsigned_abs() * 24 * 60 * 60),
