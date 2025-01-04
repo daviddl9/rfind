@@ -28,6 +28,7 @@ struct TestCase {
     mtime: Option<&'static str>,
     atime: Option<&'static str>,
     ctime: Option<&'static str>,
+    size: Option<&'static str>,
 }
 
 /// Helper struct to manage test file timestamps
@@ -37,6 +38,249 @@ struct TimeTestFile {
     /// Offset in minutes from test start time
     mtime_offset: i64,
     atime_offset: i64,
+}
+
+#[test]
+fn test_file_finder_size_filters() -> Result<(), Box<dyn std::error::Error>> {
+    // Create a temporary directory structure for testing
+    let temp_dir = TempDir::new()?;
+    let base_path = temp_dir.path();
+
+    // Create test directory
+    fs::create_dir_all(base_path.join("size_test"))?;
+    
+    // Pre-create the repeated strings
+    let small_content = "a".repeat(1024);           // 1KB
+    let medium_content = "b".repeat(1024 * 100);    // 100KB
+    let large_content = "c".repeat(1024 * 1024);    // 1MB
+    let huge_content = "d".repeat(1024 * 1024 * 5); // 5MB
+
+    // Create files of different sizes
+    let test_files = vec![
+        ("size_test/empty.txt", ""),                // 0 bytes
+        ("size_test/tiny.txt", "small"),           // 5 bytes
+        ("size_test/small.txt", &small_content),   // 1KB
+        ("size_test/medium.txt", &medium_content), // 100KB
+        ("size_test/large.txt", &large_content),   // 1MB
+        ("size_test/huge.txt", &huge_content),     // 5MB
+    ];
+
+    // Create the test files
+    for (path, content) in &test_files {
+        let file_path = base_path.join(path);
+        fs::write(&file_path, content)?;
+        
+        // Debug: Print actual file sizes
+        let metadata = fs::metadata(&file_path)?;
+        println!("File: {} (size: {} bytes)", path, metadata.len());
+    }
+
+    // Size-based test cases
+    let size_test_cases = vec![
+        TestCase {
+            pattern: "*.txt",
+            expected_counts: vec![
+                ("tiny.txt", 1),
+                ("empty.txt", 1),
+            ],
+            max_depth: None,
+            threads: Some(1),
+            type_filter: Some("f"),
+            symlink_mode: None,
+            description: "Find files smaller than 10 bytes",
+            base_path_override: Some("size_test"),
+            size: Some("-10c"),     // Less than 10 bytes
+            mtime: None,
+            atime: None,
+            ctime: None,
+        },
+        TestCase {
+            pattern: "*.txt",
+            expected_counts: vec![
+                ("medium.txt", 1),
+                ("large.txt", 1),
+                ("huge.txt", 1),
+            ],
+            max_depth: None,
+            threads: Some(1),
+            type_filter: Some("f"),
+            symlink_mode: None,
+            description: "Find files larger than 50KB",
+            base_path_override: Some("size_test"),
+            size: Some("+50k"),     // Larger than 50KB
+            mtime: None,
+            atime: None,
+            ctime: None,
+        },
+        TestCase {
+            pattern: "*.txt",
+            expected_counts: vec![
+                ("large.txt", 1),
+            ],
+            max_depth: None,
+            threads: Some(1),
+            type_filter: Some("f"),
+            symlink_mode: None,
+            description: "Find files exactly 1MB in size",
+            base_path_override: Some("size_test"),
+            size: Some("1M"),       // Exactly 1MB
+            mtime: None,
+            atime: None,
+            ctime: None,
+        },
+        TestCase {
+            pattern: "*.txt",
+            expected_counts: vec![
+                ("huge.txt", 1),
+            ],
+            max_depth: None,
+            threads: Some(1),
+            type_filter: Some("f"),
+            symlink_mode: None,
+            description: "Find files larger than 2MB",
+            base_path_override: Some("size_test"),
+            size: Some("+2M"),      // Larger than 2MB
+            mtime: None,
+            atime: None,
+            ctime: None,
+        },
+        TestCase {
+            pattern: "*.txt",
+            expected_counts: vec![
+                ("small.txt", 1),
+            ],
+            max_depth: None,
+            threads: Some(1),
+            type_filter: Some("f"),
+            symlink_mode: None,
+            description: "Find files exactly 1KB in size",
+            base_path_override: Some("size_test"),
+            size: Some("1k"),       // Exactly 1KB
+            mtime: None,
+            atime: None,
+            ctime: None,
+        },
+        TestCase {
+            pattern: "*.txt",
+            expected_counts: vec![
+                ("empty.txt", 1),
+                ("tiny.txt", 1),
+                ("small.txt", 1),
+            ],
+            max_depth: None,
+            threads: Some(1),
+            type_filter: Some("f"),
+            symlink_mode: None,
+            description: "Find files smaller than 2KB",
+            base_path_override: Some("size_test"),
+            size: Some("-2k"),      // Smaller than 2KB
+            mtime: None,
+            atime: None,
+            ctime: None,
+        },
+    ];
+
+    // Path to our compiled test binary
+    let mut bin_path = env::current_exe()?;
+    bin_path.pop(); // remove test binary name
+    bin_path.pop(); // remove "deps"
+    bin_path.push("rfind");
+
+    // Execute each test case
+    for test_case in size_test_cases {
+        println!("\nRunning size filter test case: {}", test_case.description);
+        println!("Pattern: {}", test_case.pattern);
+
+        // Build command
+        let mut cmd = Command::new(&bin_path);
+        
+        let base_dir = if let Some(rel_path) = test_case.base_path_override {
+            base_path.join(rel_path)
+        } else {
+            base_path.to_path_buf()
+        };
+
+        // Basic arguments
+        cmd.arg(test_case.pattern)
+            .arg("--dir")
+            .arg(&base_dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        // Optional arguments
+        if let Some(depth) = test_case.max_depth {
+            cmd.arg("--max-depth").arg(depth.to_string());
+        }
+        if let Some(threads) = test_case.threads {
+            cmd.arg("--threads").arg(threads.to_string());
+        }
+        if let Some(tfilter) = test_case.type_filter {
+            cmd.arg("--type").arg(tfilter);
+        }
+        if let Some(symlink_flag) = test_case.symlink_mode {
+            cmd.arg(symlink_flag);
+        }
+        if let Some(size) = test_case.size {
+            cmd.arg("--size").arg(size);
+            println!("  With size filter: {}", size);
+        }
+
+        // Run command and collect results
+        let mut child = cmd.spawn()?;
+        let mut found_counts: HashMap<String, usize> = HashMap::new();
+
+        if let Some(stdout) = child.stdout.take() {
+            let reader = BufReader::new(stdout);
+            for line_result in reader.lines() {
+                let line = line_result?;
+                if let Some(file_name) = Path::new(line.trim()).file_name().and_then(|n| n.to_str()) {
+                    *found_counts.entry(file_name.to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+
+        // Check process status
+        let status = child.wait()?;
+        if !status.success() {
+            let mut error_message = String::new();
+            if let Some(mut stderr) = child.stderr.take() {
+                std::io::Read::read_to_string(&mut stderr, &mut error_message)?;
+            }
+            return Err(format!(
+                "Process failed in test '{}' with status: {}. Stderr: {}",
+                test_case.description, status, error_message
+            ).into());
+        }
+
+        // Verify results
+        let expected_map = make_expected_map(&test_case.expected_counts);
+        println!("  Expected counts: {:?}", expected_map);
+        println!("  Found counts:    {:?}", found_counts);
+
+        // Check for expected files
+        for (expected_file, &expected_count) in &expected_map {
+            let actual_count = found_counts.get(expected_file).copied().unwrap_or(0);
+            assert_eq!(
+                actual_count, expected_count,
+                "Test '{}': Mismatch for file '{}' - expected {} occurrences, found {}",
+                test_case.description, expected_file, expected_count, actual_count
+            );
+        }
+
+        // Check for unexpected files
+        for (found_file, &count) in &found_counts {
+            if !expected_map.contains_key(found_file.as_str()) && count > 0 {
+                return Err(format!(
+                    "Test '{}': Found unexpected file '{}' with count {}",
+                    test_case.description, found_file, count
+                ).into());
+            }
+        }
+
+        println!("  ✓ Test passed: {}", test_case.description);
+    }
+
+    Ok(())
 }
 
 #[test]
@@ -120,6 +364,7 @@ fn test_file_finder_time_filters() -> Result<(), Box<dyn std::error::Error>> {
             ctime: None,
             description: "Find files modified less than 10 minutes ago",
             base_path_override: Some("time_test"),
+            size: None,
         },
         TestCase {
             pattern: "*.txt",
@@ -136,6 +381,7 @@ fn test_file_finder_time_filters() -> Result<(), Box<dyn std::error::Error>> {
             ctime: None,
             description: "Find files modified more than 30 minutes ago",
             base_path_override: Some("time_test"),
+            size: None,
         },
         TestCase {
             pattern: "*.txt",
@@ -151,6 +397,7 @@ fn test_file_finder_time_filters() -> Result<(), Box<dyn std::error::Error>> {
             ctime: None,
             description: "Find files modified exactly 1 hour ago",
             base_path_override: Some("time_test"),
+            size: None,
         },
         TestCase {
             pattern: "*.txt",
@@ -166,6 +413,7 @@ fn test_file_finder_time_filters() -> Result<(), Box<dyn std::error::Error>> {
             ctime: None,
             description: "Find files accessed less than 5 minutes ago",
             base_path_override: Some("time_test"),
+            size: None,
         },
         TestCase {
             pattern: "*.txt",
@@ -181,6 +429,7 @@ fn test_file_finder_time_filters() -> Result<(), Box<dyn std::error::Error>> {
             ctime: None,
             description: "Find files with combined modification and access time filters",
             base_path_override: Some("time_test"),
+            size: None,
         },
         #[cfg(unix)]
         TestCase {
@@ -199,6 +448,7 @@ fn test_file_finder_time_filters() -> Result<(), Box<dyn std::error::Error>> {
             ctime: Some("-120m"),   // Changed less than 2 hours ago
             description: "Find files changed less than 2 hours ago (Unix only)",
             base_path_override: Some("time_test"),
+            size: None,
         },
     ];
 
@@ -401,6 +651,7 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             atime: None,
             ctime: None,
             mtime: None,
+            size: None,
         },
         TestCase {
             pattern: "*.log",
@@ -420,6 +671,7 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             atime: None,
             ctime: None,
             mtime: None,
+            size: None,
         },
         // Filter by type = f (only files)
         TestCase {
@@ -442,6 +694,7 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             atime: None,
             ctime: None,
             mtime: None,
+            size: None,
         },
         // Filter by type = d (only dirs)
         TestCase {
@@ -460,6 +713,7 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             atime: None,
             ctime: None,
             mtime: None,
+            size: None,
         },
         // Filter by type = l (only symlinks)
         TestCase {
@@ -478,6 +732,7 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             atime: None,
             ctime: None,
             mtime: None,
+            size: None,
         },
         // Combined pattern + filter
         TestCase {
@@ -497,6 +752,7 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             atime: None,
             ctime: None,
             mtime: None,
+            size: None,
         },
         // Depth limit
         TestCase {
@@ -515,6 +771,7 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             atime: None,
             ctime: None,
             mtime: None,
+            size: None,
         },
         // 1) -L: Always follow symlinks
         // Pattern matches "*test6.log", so it will match "test6.log" (real file)
@@ -538,6 +795,7 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             atime: None,
             ctime: None,
             mtime: None,
+            size: None,
         },
 
         // 2) -H: Follow symlinks only if they are on the command line
@@ -561,6 +819,7 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             atime: None,
             ctime: None,
             mtime: None,
+            size: None,
         },
 
         // 3) An example to demonstrate that -H *does* follow symlink if used as the CLI dir:
@@ -586,6 +845,7 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             atime: None,
             ctime: None,
             mtime: None,
+            size: None,
         },
     ];
 

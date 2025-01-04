@@ -218,6 +218,29 @@ You can combine multiple time filters to create more specific searches:
   rfind "*.conf" --ctime -30m --mtime +7d
   ```
 
+### 🚛 Size-Based Filtering 
+
+Use `--size` to filter files by size using `[+-]N[ckMG]` format:
+- `c` (bytes), `k` (KB), `M` (MB), `G` (GB)
+- `+` for larger, `-` for smaller, no prefix for exact match
+
+```bash
+# Find files larger than 1GB
+rfind "*" --size +1G
+
+# Find small configs (<10KB)
+rfind "*.conf" --size -10k
+
+# Large logs (>100MB) not accessed in a week
+rfind "*.log" --size +100M --atime +7d
+
+# Find and compress large old logs
+rfind "*.log" --size +100M --mtime +7d --print0 | xargs -0 gzip -9
+
+# Calculate the total size of old large files
+rfind "*" --size +1G --mtime +30d --print0 | xargs -0 du -ch
+```
+
 ## 💡 Additional Suggestions
 
 - **Avoiding hidden files or directories**: Currently, `rfind` doesn’t provide a built-in flag to ignore `.*` entries. For now, you can combine `rfind` with standard shell utilities like `grep` or `sed` to filter results if you need to exclude hidden files:

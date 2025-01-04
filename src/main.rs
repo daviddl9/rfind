@@ -114,6 +114,100 @@ enum SymlinkMode {
     Always,  // -L: Follow all symlinks
 }
 
+/// Represents a size comparison operation
+#[derive(Debug, Clone, Copy)]
+enum SizeComparison {
+    Exactly, // n
+    Lesser,  // -n
+    Greater, // +n
+}
+
+/// Represents a size unit for comparison
+#[derive(Debug, Clone, Copy)]
+enum SizeUnit {
+    Bytes,     // c
+    Kilobytes, // k
+    Megabytes, // M
+    Gigabytes, // G
+}
+
+/// Holds size-based filter configuration
+#[derive(Debug, Clone)]
+struct SizeFilter {
+    comparison: SizeComparison,
+    value: u64,
+    unit: SizeUnit,
+}
+
+impl SizeFilter {
+    /// Parse a size filter string in the format: [+-]N[ckmG]
+    /// Examples: "+1M" (more than 1 MB), "-500k" (less than 500 KB), "1G" (about 1 GB)
+    fn parse(s: &str) -> Result<Self, String> {
+        let (comparison, rest) = match s.chars().next() {
+            Some('+') => (SizeComparison::Greater, &s[1..]),
+            Some('-') => (SizeComparison::Lesser, &s[1..]),
+            Some(_) => (SizeComparison::Exactly, s),
+            None => return Err("Empty size filter".to_string()),
+        };
+
+        let unit = match rest.chars().last() {
+            Some('c') => SizeUnit::Bytes,
+            Some('k') => SizeUnit::Kilobytes,
+            Some('M') => SizeUnit::Megabytes,
+            Some('G') => SizeUnit::Gigabytes,
+            _ => {
+                return Err(
+                    "Invalid size unit. Use c (bytes), k (KB), M (MB), or G (GB)".to_string(),
+                )
+            }
+        };
+
+        let value_str = &rest[..rest.len() - 1];
+        let value = value_str
+            .parse::<u64>()
+            .map_err(|_| "Invalid number in size filter".to_string())?;
+
+        Ok(SizeFilter {
+            comparison,
+            value,
+            unit,
+        })
+    }
+
+    /// Convert the size filter value to bytes
+    fn to_bytes(&self) -> u64 {
+        match self.unit {
+            SizeUnit::Bytes => self.value,
+            SizeUnit::Kilobytes => self.value * 1024,
+            SizeUnit::Megabytes => self.value * 1024 * 1024,
+            SizeUnit::Gigabytes => self.value * 1024 * 1024 * 1024,
+        }
+    }
+
+    /// Check if a file's size matches the filter
+    fn matches(&self, file_size: u64) -> bool {
+        let target_size = self.to_bytes();
+
+        match self.comparison {
+            SizeComparison::Exactly => {
+                // For exact matches, we'll allow a small tolerance based on the unit
+                let tolerance = match self.unit {
+                    SizeUnit::Bytes => 0,
+                    SizeUnit::Kilobytes => 512,         // ±0.5KB
+                    SizeUnit::Megabytes => 524_288,     // ±0.5MB
+                    SizeUnit::Gigabytes => 536_870_912, // ±0.5GB
+                };
+
+                let lower = target_size.saturating_sub(tolerance);
+                let upper = target_size.saturating_add(tolerance);
+                file_size >= lower && file_size <= upper
+            }
+            SizeComparison::Lesser => file_size < target_size,
+            SizeComparison::Greater => file_size > target_size,
+        }
+    }
+}
+
 /// Enum to filter results by type.
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 enum TypeFilter {
@@ -225,6 +319,11 @@ struct Args {
     /// Filter by change time (format: [+-]N[smhd])
     #[arg(long = "ctime", allow_hyphen_values = true)]
     ctime: Option<String>,
+
+    /// Filter by file size (format: [+-]N[ckMG])
+    /// Examples: +1M (more than 1MB), -500k (less than 500KB), 1G (exactly 1GB)
+    #[arg(long = "size", allow_hyphen_values = true)]
+    size: Option<String>,
 }
 
 impl Args {
@@ -251,6 +350,7 @@ struct ScannerContext {
     atime_filter: Option<TimeFilter>,
     ctime_filter: Option<TimeFilter>,
     now: SystemTime,
+    size_filter: Option<SizeFilter>,
 }
 
 fn normalize_path(path: &Path, root: &Path) -> PathBuf {
@@ -308,6 +408,13 @@ fn is_type_match(metadata: &std::fs::Metadata, filter: TypeFilter, ctx: &Scanner
 
     if !base_match {
         return false;
+    }
+
+    // Apply size filter if present
+    if let Some(size_filter) = &ctx.size_filter {
+        if !size_filter.matches(metadata.len()) {
+            return false;
+        }
     }
 
     // Apply time filters
@@ -444,6 +551,7 @@ struct ScannerConfig {
     atime_filter: Option<TimeFilter>,
     ctime_filter: Option<TimeFilter>,
     now: SystemTime,
+    size_filter: Option<SizeFilter>,
 }
 
 fn spawn_scanner_thread(config: ScannerConfig) -> thread::JoinHandle<()> {
@@ -475,6 +583,7 @@ fn spawn_scanner_thread(config: ScannerConfig) -> thread::JoinHandle<()> {
                 atime_filter: config.atime_filter.clone(),
                 ctime_filter: config.ctime_filter.clone(),
                 now: config.now,
+                size_filter: config.size_filter.clone(),
             };
 
             // More defensive read_dir handling
@@ -577,6 +686,7 @@ struct ThreadPoolOptions {
     atime_filter: Option<TimeFilter>,
     ctime_filter: Option<TimeFilter>,
     now: SystemTime,
+    size_filter: Option<SizeFilter>,
 }
 
 fn setup_thread_pool(pool_options: ThreadPoolOptions) -> ThreadPool {
@@ -599,6 +709,7 @@ fn setup_thread_pool(pool_options: ThreadPoolOptions) -> ThreadPool {
             atime_filter: pool_options.atime_filter.clone(),
             ctime_filter: pool_options.ctime_filter.clone(),
             now: pool_options.now,
+            size_filter: pool_options.size_filter.clone(),
         });
         scanner_handles.push(handle);
     }
@@ -650,6 +761,15 @@ fn main() {
             eprintln!("Invalid ctime filter: {}", e);
             std::process::exit(1);
         });
+    let size_filter = args
+        .size
+        .as_deref()
+        .map(SizeFilter::parse)
+        .transpose()
+        .unwrap_or_else(|e| {
+            eprintln!("Invalid size filter: {}", e);
+            std::process::exit(1);
+        });
     let pattern = Arc::new(create_pattern_matcher(&args.pattern));
     let thread_count = args.threads.unwrap_or_else(num_cpus::get);
     let symlink_mode = args.symlink_mode();
@@ -683,6 +803,7 @@ fn main() {
         atime_filter,
         ctime_filter,
         now: SystemTime::now(),
+        size_filter,
     });
 
     // Process results
