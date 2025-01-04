@@ -141,7 +141,7 @@ struct SizeFilter {
 
 impl SizeFilter {
     /// Parse a size filter string in the format: [+-]N[ckmG]
-    /// Examples: "+1M" (more than 1 MB), "-500k" (less than 500 KB), "1G" (about 1 GB)
+    /// Examples: "+1M" (more than 1 MiB), "-500k" (less than 500 KiB), "1G" (about 1 GiB)
     fn parse(s: &str) -> Result<Self, String> {
         let (comparison, rest) = match s.chars().next() {
             Some('+') => (SizeComparison::Greater, &s[1..]),
@@ -321,7 +321,7 @@ struct Args {
     ctime: Option<String>,
 
     /// Filter by file size (format: [+-]N[ckMG])
-    /// Examples: +1M (more than 1MB), -500k (less than 500KB), 1G (exactly 1GB)
+    /// Examples: +1M (more than 1MiB), -500k (less than 500KiB), 1G (approximately 1GiB)
     #[arg(long = "size", allow_hyphen_values = true)]
     size: Option<String>,
 }
