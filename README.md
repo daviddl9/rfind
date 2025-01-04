@@ -72,6 +72,7 @@ Options:
       --mtime <MTIME>          Filter by modification time (format: [+-]N[smhd]) Examples: +1d (more than 1 day), -2m (less than 2 minutes), 3d (exactly 3 days), +1h (more than 1 hour), -45s (less than 45 seconds)
       --atime <ATIME>          Filter by access time (format: [+-]N[smhd])
       --ctime <CTIME>          Filter by change time (format: [+-]N[smhd])
+      --size <SIZE>            Filter by file size (format: [+-]N[ckMG]) Examples: +1M (more than 1MiB), -500k (less than 500KiB), 1G (approximately 1GiB)
   -h, --help                   Print help
   -V, --version                Print version
 ```
@@ -217,6 +218,29 @@ You can combine multiple time filters to create more specific searches:
   ```bash
   rfind "*.conf" --ctime -30m --mtime +7d
   ```
+
+### 🚛 Size-Based Filtering 
+
+Use `--size` to filter files by size using `[+-]N[ckMG]` format:
+- `c` (bytes), `k` (KB), `M` (MB), `G` (GB)
+- `+` for larger, `-` for smaller, no prefix for exact match
+
+```bash
+# Find files larger than 1GiB
+rfind "*" --size +1G
+
+# Find small configs (<10KiB)
+rfind "*.conf" --size -10k
+
+# Large logs (>100MiB) not accessed in a week
+rfind "*.log" --size +100M --atime +7d
+
+# Find and compress large old logs
+rfind "*.log" --size +100M --mtime +7d --print0 | xargs -0 gzip -9
+
+# Calculate the total size of old large files
+rfind "*" --size +1G --mtime +30d --print0 | xargs -0 du -ch
+```
 
 ## 💡 Additional Suggestions
 
