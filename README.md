@@ -226,13 +226,13 @@ Use `--size` to filter files by size using `[+-]N[ckMG]` format:
 - `+` for larger, `-` for smaller, no prefix for exact match
 
 ```bash
-# Find files larger than 1GB
+# Find files larger than 1GiB
 rfind "*" --size +1G
 
-# Find small configs (<10KB)
+# Find small configs (<10KiB)
 rfind "*.conf" --size -10k
 
-# Large logs (>100MB) not accessed in a week
+# Large logs (>100MiB) not accessed in a week
 rfind "*.log" --size +100M --atime +7d
 
 # Find and compress large old logs
