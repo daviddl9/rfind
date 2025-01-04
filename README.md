@@ -72,6 +72,7 @@ Options:
       --mtime <MTIME>          Filter by modification time (format: [+-]N[smhd]) Examples: +1d (more than 1 day), -2m (less than 2 minutes), 3d (exactly 3 days), +1h (more than 1 hour), -45s (less than 45 seconds)
       --atime <ATIME>          Filter by access time (format: [+-]N[smhd])
       --ctime <CTIME>          Filter by change time (format: [+-]N[smhd])
+      --size <SIZE>            Filter by file size (format: [+-]N[ckMG]) Examples: +1M (more than 1MB), -500k (less than 500KB), 1G (exactly 1GB)
   -h, --help                   Print help
   -V, --version                Print version
 ```
