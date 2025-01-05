@@ -1,5 +1,9 @@
 use std::fs::Metadata;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 
 /// Represents permission filter mode
 #[derive(Debug, Clone, Copy)]
@@ -67,31 +71,55 @@ impl PermissionFilter {
 
     /// Check if file permissions match the filter
     pub fn matches(&self, metadata: &Metadata) -> bool {
-        let mode = metadata.mode();
+        #[cfg(unix)]
+        {
+            let mode = metadata.mode();
+            let check_permission = |bits: u32| -> bool {
+                match self.perm_type {
+                    PermissionType::Read => (mode & bits & 0o444) != 0,
+                    PermissionType::Write => (mode & bits & 0o222) != 0,
+                    PermissionType::Execute => (mode & bits & 0o111) != 0,
+                    PermissionType::SetID => match self.mode {
+                        PermissionMode::User => (mode & 0o4000) != 0,  // setuid
+                        PermissionMode::Group => (mode & 0o2000) != 0, // setgid
+                        _ => false, // setid bit only valid for user/group
+                    },
+                }
+            };
 
-        let check_permission = |bits: u32| -> bool {
-            match self.perm_type {
-                PermissionType::Read => (mode & bits & 0o444) != 0,
-                PermissionType::Write => (mode & bits & 0o222) != 0,
-                PermissionType::Execute => (mode & bits & 0o111) != 0,
-                PermissionType::SetID => match self.mode {
-                    PermissionMode::User => (mode & 0o4000) != 0,  // setuid
-                    PermissionMode::Group => (mode & 0o2000) != 0, // setgid
-                    _ => false, // setid bit only valid for user/group
-                },
-            }
-        };
+            let result = match self.mode {
+                PermissionMode::User => check_permission(0o700),
+                PermissionMode::Group => check_permission(0o070),
+                PermissionMode::Others => check_permission(0o007),
+                PermissionMode::All => {
+                    check_permission(0o700) && check_permission(0o070) && check_permission(0o007)
+                }
+            };
 
-        let result = match self.mode {
-            PermissionMode::User => check_permission(0o700),
-            PermissionMode::Group => check_permission(0o070),
-            PermissionMode::Others => check_permission(0o007),
-            PermissionMode::All => {
-                check_permission(0o700) && check_permission(0o070) && check_permission(0o007)
-            }
-        };
+            result == self.expected
+        }
 
-        result == self.expected
+        #[cfg(windows)]
+        {
+            // Windows has a different permission model - we'll map some basic concepts
+            let readonly = metadata.file_attributes() & 0x1 != 0;
+
+            let result = match self.perm_type {
+                PermissionType::Read => !readonly,
+                PermissionType::Write => !readonly,
+                PermissionType::Execute => {
+                    // Check file extension for .exe, .bat, .cmd
+                    if let Some(ext) = metadata.file_name().and_then(|n| n.to_str()) {
+                        ext.ends_with(".exe") || ext.ends_with(".bat") || ext.ends_with(".cmd")
+                    } else {
+                        false
+                    }
+                }
+                PermissionType::SetID => false, // Windows doesn't have setuid/setgid
+            };
+
+            result == self.expected
+        }
     }
 }
 
@@ -110,9 +138,19 @@ impl OwnershipFilter {
 
     /// Check if file ownership matches the filter
     pub fn matches(&self, metadata: &Metadata) -> bool {
-        let uid_match = self.uid.map_or(true, |uid| metadata.uid() == uid);
-        let gid_match = self.gid.map_or(true, |gid| metadata.gid() == gid);
-        uid_match && gid_match
+        #[cfg(unix)]
+        {
+            let uid_match = self.uid.map_or(true, |uid| metadata.uid() == uid);
+            let gid_match = self.gid.map_or(true, |gid| metadata.gid() == gid);
+            uid_match && gid_match
+        }
+
+        #[cfg(windows)]
+        {
+            // Windows doesn't use UID/GID - could potentially map to SID/ACL checks
+            // For now, we'll just allow all ownership checks
+            true
+        }
     }
 }
 
@@ -126,75 +164,102 @@ pub enum SpecialMode {
 
 /// Check for special mode bits
 pub fn has_special_mode(metadata: &Metadata, mode: SpecialMode) -> bool {
-    let mode_bits = metadata.mode();
-    match mode {
-        SpecialMode::SetUID => (mode_bits & 0o4000) != 0,
-        SpecialMode::SetGID => (mode_bits & 0o2000) != 0,
-        SpecialMode::Sticky => (mode_bits & 0o1000) != 0,
+    #[cfg(unix)]
+    {
+        let mode_bits = metadata.mode();
+        match mode {
+            SpecialMode::SetUID => (mode_bits & 0o4000) != 0,
+            SpecialMode::SetGID => (mode_bits & 0o2000) != 0,
+            SpecialMode::Sticky => (mode_bits & 0o1000) != 0,
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        // Windows doesn't support these special modes
+        false
     }
 }
 
 /// Get string representation of file permissions (like ls -l)
 pub fn get_permission_string(metadata: &Metadata) -> String {
-    let mode = metadata.mode();
-    let mut result = String::with_capacity(10);
+    #[cfg(unix)]
+    {
+        let mode = metadata.mode();
+        let mut result = String::with_capacity(10);
 
-    // File type
-    result.push(match mode & 0o170000 {
-        0o140000 => 's', // socket
-        0o120000 => 'l', // symlink
-        0o100000 => '-', // regular file
-        0o060000 => 'b', // block device
-        0o040000 => 'd', // directory
-        0o020000 => 'c', // character device
-        0o010000 => 'p', // fifo
-        _ => '?',
-    });
+        // File type
+        result.push(match mode & 0o170000 {
+            0o140000 => 's', // socket
+            0o120000 => 'l', // symlink
+            0o100000 => '-', // regular file
+            0o060000 => 'b', // block device
+            0o040000 => 'd', // directory
+            0o020000 => 'c', // character device
+            0o010000 => 'p', // fifo
+            _ => '?',
+        });
 
-    // User permissions
-    result.push(if mode & 0o400 != 0 { 'r' } else { '-' });
-    result.push(if mode & 0o200 != 0 { 'w' } else { '-' });
-    result.push(if mode & 0o4000 != 0 {
-        if mode & 0o100 != 0 {
-            's'
+        // User permissions
+        result.push(if mode & 0o400 != 0 { 'r' } else { '-' });
+        result.push(if mode & 0o200 != 0 { 'w' } else { '-' });
+        result.push(if mode & 0o4000 != 0 {
+            if mode & 0o100 != 0 {
+                's'
+            } else {
+                'S'
+            }
+        } else if mode & 0o100 != 0 {
+            'x'
         } else {
-            'S'
-        }
-    } else if mode & 0o100 != 0 {
-        'x'
-    } else {
-        '-'
-    });
+            '-'
+        });
 
-    // Group permissions
-    result.push(if mode & 0o040 != 0 { 'r' } else { '-' });
-    result.push(if mode & 0o020 != 0 { 'w' } else { '-' });
-    result.push(if mode & 0o2000 != 0 {
-        if mode & 0o010 != 0 {
-            's'
+        // Group permissions
+        result.push(if mode & 0o040 != 0 { 'r' } else { '-' });
+        result.push(if mode & 0o020 != 0 { 'w' } else { '-' });
+        result.push(if mode & 0o2000 != 0 {
+            if mode & 0o010 != 0 {
+                's'
+            } else {
+                'S'
+            }
+        } else if mode & 0o010 != 0 {
+            'x'
         } else {
-            'S'
-        }
-    } else if mode & 0o010 != 0 {
-        'x'
-    } else {
-        '-'
-    });
+            '-'
+        });
 
-    // Others permissions
-    result.push(if mode & 0o004 != 0 { 'r' } else { '-' });
-    result.push(if mode & 0o002 != 0 { 'w' } else { '-' });
-    result.push(if mode & 0o1000 != 0 {
-        if mode & 0o001 != 0 {
-            't'
+        // Others permissions
+        result.push(if mode & 0o004 != 0 { 'r' } else { '-' });
+        result.push(if mode & 0o002 != 0 { 'w' } else { '-' });
+        result.push(if mode & 0o1000 != 0 {
+            if mode & 0o001 != 0 {
+                't'
+            } else {
+                'T'
+            }
+        } else if mode & 0o001 != 0 {
+            'x'
         } else {
-            'T'
-        }
-    } else if mode & 0o001 != 0 {
-        'x'
-    } else {
-        '-'
-    });
+            '-'
+        });
 
-    result
+        result
+    }
+    #[cfg(windows)]
+    {
+        let attrs = metadata.file_attributes();
+        let mut result = String::with_capacity(10);
+
+        // Simplified Windows-style permissions
+        result.push(if attrs & 0x10 != 0 { 'd' } else { '-' }); // Directory
+        result.push(if attrs & 0x1 == 0 { 'w' } else { '-' }); // !Readonly
+        result.push(if attrs & 0x1 == 0 { 'r' } else { '-' }); // !Readonly
+        result.push(if attrs & 0x20 != 0 { 'a' } else { '-' }); // Archive
+        result.push(if attrs & 0x2 != 0 { 'h' } else { '-' }); // Hidden
+        result.push(if attrs & 0x4 != 0 { 's' } else { '-' }); // System
+
+        result
+    }
 }
