@@ -6,6 +6,7 @@ use log::debug;
 use memchr::memmem::FinderBuilder; // Uses Boyer-Moore-Horspool algorithm for substring search
 use parking_lot::Mutex;
 use pathdiff::diff_paths;
+use rfind::permissions::{OwnershipFilter, PermissionFilter};
 use std::error::Error;
 use std::io::Write;
 use std::path::Path;
@@ -324,6 +325,19 @@ struct Args {
     /// Examples: +1M (more than 1MiB), -500k (less than 500KiB), 1G (approximately 1GiB)
     #[arg(long = "size", allow_hyphen_values = true)]
     size: Option<String>,
+
+    /// Permission filter (format: [ugoa][+-][rwx])
+    /// Examples: u+x (user has execute), g-w (group doesn't have write)
+    #[arg(long = "perm", allow_hyphen_values = true)]
+    perm: Option<String>,
+
+    /// Owner filter by UID
+    #[arg(long = "uid")]
+    uid: Option<u32>,
+
+    /// Group filter by GID
+    #[arg(long = "gid")]
+    gid: Option<u32>,
 }
 
 impl Args {
@@ -351,6 +365,8 @@ struct ScannerContext {
     ctime_filter: Option<TimeFilter>,
     now: SystemTime,
     size_filter: Option<SizeFilter>,
+    perm_filter: Option<PermissionFilter>,
+    ownership_filter: Option<OwnershipFilter>,
 }
 
 fn normalize_path(path: &Path, root: &Path) -> PathBuf {
@@ -408,6 +424,20 @@ fn is_type_match(metadata: &std::fs::Metadata, filter: TypeFilter, ctx: &Scanner
 
     if !base_match {
         return false;
+    }
+
+    // Apply permission filter if present
+    if let Some(perm_filter) = &ctx.perm_filter {
+        if !perm_filter.matches(metadata) {
+            return false;
+        }
+    }
+
+    // Apply ownership filter if present
+    if let Some(ownership_filter) = &ctx.ownership_filter {
+        if !ownership_filter.matches(metadata) {
+            return false;
+        }
     }
 
     // Apply size filter if present
@@ -552,6 +582,8 @@ struct ScannerConfig {
     ctime_filter: Option<TimeFilter>,
     now: SystemTime,
     size_filter: Option<SizeFilter>,
+    perm_filter: Option<PermissionFilter>,
+    ownership_filter: Option<OwnershipFilter>,
 }
 
 fn spawn_scanner_thread(config: ScannerConfig) -> thread::JoinHandle<()> {
@@ -584,6 +616,8 @@ fn spawn_scanner_thread(config: ScannerConfig) -> thread::JoinHandle<()> {
                 ctime_filter: config.ctime_filter.clone(),
                 now: config.now,
                 size_filter: config.size_filter.clone(),
+                perm_filter: config.perm_filter.clone(),
+                ownership_filter: config.ownership_filter.clone(),
             };
 
             // More defensive read_dir handling
@@ -687,6 +721,8 @@ struct ThreadPoolOptions {
     ctime_filter: Option<TimeFilter>,
     now: SystemTime,
     size_filter: Option<SizeFilter>,
+    perm_filter: Option<PermissionFilter>,
+    ownership_filter: Option<OwnershipFilter>,
 }
 
 fn setup_thread_pool(pool_options: ThreadPoolOptions) -> ThreadPool {
@@ -710,6 +746,8 @@ fn setup_thread_pool(pool_options: ThreadPoolOptions) -> ThreadPool {
             ctime_filter: pool_options.ctime_filter.clone(),
             now: pool_options.now,
             size_filter: pool_options.size_filter.clone(),
+            perm_filter: pool_options.perm_filter.clone(),
+            ownership_filter: pool_options.ownership_filter.clone(),
         });
         scanner_handles.push(handle);
     }
@@ -730,6 +768,24 @@ fn setup_thread_pool(pool_options: ThreadPoolOptions) -> ThreadPool {
 
 fn main() {
     let args = Args::parse();
+
+    // Parse permission filter if provided
+    let perm_filter = args
+        .perm
+        .as_deref()
+        .map(PermissionFilter::parse)
+        .transpose()
+        .unwrap_or_else(|e| {
+            eprintln!("Invalid permission filter: {}", e);
+            std::process::exit(1);
+        });
+
+    // Create ownership filter if either uid or gid is specified
+    let ownership_filter = if args.uid.is_some() || args.gid.is_some() {
+        Some(OwnershipFilter::new(args.uid, args.gid))
+    } else {
+        None
+    };
 
     // Parse time filters
     let mtime_filter = args
@@ -804,6 +860,8 @@ fn main() {
         ctime_filter,
         now: SystemTime::now(),
         size_filter,
+        perm_filter,
+        ownership_filter,
     });
 
     // Process results

@@ -7,6 +7,10 @@ use std::process::{Command, Stdio};
 use tempfile::TempDir;
 use filetime::*;
 use std::time::{SystemTime, Duration};
+use rfind::permissions::{PermissionFilter, PermissionMode, PermissionType, SpecialMode, has_special_mode};
+use std::fs::File;
+use std::os::unix::fs::{PermissionsExt, MetadataExt};
+use tempfile::tempdir;
 
 /// Represents a single integration test configuration
 struct TestCase {
@@ -29,6 +33,9 @@ struct TestCase {
     atime: Option<&'static str>,
     ctime: Option<&'static str>,
     size: Option<&'static str>,
+    perm: Option<&'static str>,
+    gid: Option<&'static str>,
+    uid: Option<&'static str>,
 }
 
 /// Helper struct to manage test file timestamps
@@ -93,6 +100,9 @@ fn test_file_finder_size_filters() -> Result<(), Box<dyn std::error::Error>> {
             mtime: None,
             atime: None,
             ctime: None,
+            perm: None,
+            gid: None,
+            uid: None,
         },
         TestCase {
             pattern: "*.txt",
@@ -111,6 +121,9 @@ fn test_file_finder_size_filters() -> Result<(), Box<dyn std::error::Error>> {
             mtime: None,
             atime: None,
             ctime: None,
+            perm: None,
+            gid: None,
+            uid: None,
         },
         TestCase {
             pattern: "*.txt",
@@ -127,6 +140,9 @@ fn test_file_finder_size_filters() -> Result<(), Box<dyn std::error::Error>> {
             mtime: None,
             atime: None,
             ctime: None,
+            perm: None,
+            gid: None,
+            uid: None,
         },
         TestCase {
             pattern: "*.txt",
@@ -143,6 +159,9 @@ fn test_file_finder_size_filters() -> Result<(), Box<dyn std::error::Error>> {
             mtime: None,
             atime: None,
             ctime: None,
+            perm: None,
+            gid: None,
+            uid: None,
         },
         TestCase {
             pattern: "*.txt",
@@ -159,6 +178,9 @@ fn test_file_finder_size_filters() -> Result<(), Box<dyn std::error::Error>> {
             mtime: None,
             atime: None,
             ctime: None,
+            perm: None,
+            gid: None,
+            uid: None,
         },
         TestCase {
             pattern: "*.txt",
@@ -177,6 +199,9 @@ fn test_file_finder_size_filters() -> Result<(), Box<dyn std::error::Error>> {
             mtime: None,
             atime: None,
             ctime: None,
+            perm: None,
+            gid: None,
+            uid: None,
         },
     ];
 
@@ -284,6 +309,48 @@ fn test_file_finder_size_filters() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn test_permission_filter_parsing() {
+    let filter = PermissionFilter::parse("u+x").unwrap();
+    assert!(matches!(filter.mode, PermissionMode::User));
+    assert!(matches!(filter.perm_type, PermissionType::Execute));
+    assert!(filter.expected);
+
+    assert!(PermissionFilter::parse("invalid").is_err());
+}
+
+#[test]
+fn test_permission_matching() {
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("test.txt");
+    let file = File::create(&file_path).unwrap();
+    
+    // Set permission to 755 (rwxr-xr-x)
+    file.set_permissions(std::fs::Permissions::from_mode(0o755)).unwrap();
+    
+    let metadata = std::fs::metadata(&file_path).unwrap();
+    
+    let filter = PermissionFilter::parse("u+x").unwrap();
+    assert!(filter.matches(&metadata));
+    
+    let filter = PermissionFilter::parse("o-w").unwrap();
+    assert!(filter.matches(&metadata));
+}
+
+#[test]
+fn test_special_modes() {
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("test.txt");
+    let file = File::create(&file_path).unwrap();
+    
+    // Set setuid bit (4755)
+    file.set_permissions(std::fs::Permissions::from_mode(0o4755)).unwrap();
+    
+    let metadata = std::fs::metadata(&file_path).unwrap();
+    assert!(has_special_mode(&metadata, SpecialMode::SetUID));
+    assert!(!has_special_mode(&metadata, SpecialMode::SetGID));
+}
+
+#[test]
 fn test_file_finder_time_filters() -> Result<(), Box<dyn std::error::Error>> {
     // Create a temporary directory structure for testing
     let temp_dir = TempDir::new()?;
@@ -365,6 +432,9 @@ fn test_file_finder_time_filters() -> Result<(), Box<dyn std::error::Error>> {
             description: "Find files modified less than 10 minutes ago",
             base_path_override: Some("time_test"),
             size: None,
+            perm: None,
+            gid: None,
+            uid: None,
         },
         TestCase {
             pattern: "*.txt",
@@ -382,6 +452,9 @@ fn test_file_finder_time_filters() -> Result<(), Box<dyn std::error::Error>> {
             description: "Find files modified more than 30 minutes ago",
             base_path_override: Some("time_test"),
             size: None,
+            perm: None,
+            gid: None,
+            uid: None,
         },
         TestCase {
             pattern: "*.txt",
@@ -398,6 +471,9 @@ fn test_file_finder_time_filters() -> Result<(), Box<dyn std::error::Error>> {
             description: "Find files modified exactly 1 hour ago",
             base_path_override: Some("time_test"),
             size: None,
+            perm: None,
+            gid: None,
+            uid: None,
         },
         TestCase {
             pattern: "*.txt",
@@ -414,6 +490,9 @@ fn test_file_finder_time_filters() -> Result<(), Box<dyn std::error::Error>> {
             description: "Find files accessed less than 5 minutes ago",
             base_path_override: Some("time_test"),
             size: None,
+            perm: None,
+            gid: None,
+            uid: None,
         },
         TestCase {
             pattern: "*.txt",
@@ -430,6 +509,9 @@ fn test_file_finder_time_filters() -> Result<(), Box<dyn std::error::Error>> {
             description: "Find files with combined modification and access time filters",
             base_path_override: Some("time_test"),
             size: None,
+            perm: None,
+            gid: None,
+            uid: None,
         },
         #[cfg(unix)]
         TestCase {
@@ -449,6 +531,9 @@ fn test_file_finder_time_filters() -> Result<(), Box<dyn std::error::Error>> {
             description: "Find files changed less than 2 hours ago (Unix only)",
             base_path_override: Some("time_test"),
             size: None,
+            perm: None,
+            gid: None,
+            uid: None,
         },
     ];
 
@@ -652,6 +737,9 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             ctime: None,
             mtime: None,
             size: None,
+            perm: None,
+            gid: None,
+            uid: None,
         },
         TestCase {
             pattern: "*.log",
@@ -672,6 +760,9 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             ctime: None,
             mtime: None,
             size: None,
+            perm: None,
+            gid: None,
+            uid: None,
         },
         // Filter by type = f (only files)
         TestCase {
@@ -695,6 +786,9 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             ctime: None,
             mtime: None,
             size: None,
+            perm: None,
+            gid: None,
+            uid: None,
         },
         // Filter by type = d (only dirs)
         TestCase {
@@ -714,6 +808,9 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             ctime: None,
             mtime: None,
             size: None,
+            perm: None,
+            gid: None,
+            uid: None,
         },
         // Filter by type = l (only symlinks)
         TestCase {
@@ -733,6 +830,9 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             ctime: None,
             mtime: None,
             size: None,
+            perm: None,
+            gid: None,
+            uid: None,
         },
         // Combined pattern + filter
         TestCase {
@@ -753,6 +853,9 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             ctime: None,
             mtime: None,
             size: None,
+            perm: None,
+            gid: None,
+            uid: None,
         },
         // Depth limit
         TestCase {
@@ -772,6 +875,9 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             ctime: None,
             mtime: None,
             size: None,
+            perm: None,
+            gid: None,
+            uid: None,
         },
         // 1) -L: Always follow symlinks
         // Pattern matches "*test6.log", so it will match "test6.log" (real file)
@@ -796,6 +902,9 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             ctime: None,
             mtime: None,
             size: None,
+            perm: None,
+            gid: None,
+            uid: None,
         },
 
         // 2) -H: Follow symlinks only if they are on the command line
@@ -820,6 +929,9 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             ctime: None,
             mtime: None,
             size: None,
+            perm: None,
+            gid: None,
+            uid: None,
         },
 
         // 3) An example to demonstrate that -H *does* follow symlink if used as the CLI dir:
@@ -846,6 +958,9 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
             ctime: None,
             mtime: None,
             size: None,
+            perm: None,
+            gid: None,
+            uid: None,
         },
     ];
 
@@ -939,6 +1054,296 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_file_finder_permission_filters() -> Result<(), Box<dyn std::error::Error>> {
+    // Create a temporary directory structure for testing
+    let temp_dir = TempDir::new()?;
+    let base_path = temp_dir.path();
+
+    // Create test directory
+    fs::create_dir_all(base_path.join("perm_test"))?;
+    
+    // Create test files with different permissions
+    let test_files = vec![
+        ("perm_test/exec.txt", 0o755),      // rwxr-xr-x
+        ("perm_test/no_exec.txt", 0o644),   // rw-r--r--
+        ("perm_test/all_exec.txt", 0o777),  // rwxrwxrwx
+        ("perm_test/no_read.txt", 0o333),   // -wx-wx-wx
+        ("perm_test/no_write.txt", 0o555),  // r-xr-xr-x
+        ("perm_test/group_write.txt", 0o674),// rw-rwxr--
+        ("perm_test/setuid.txt", 0o4755),   // rwsr-xr-x
+        ("perm_test/setgid.txt", 0o2755),   // rwxr-sr-x
+        ("perm_test/sticky.txt", 0o1755),   // rwxr-xr-t
+    ];
+
+    // Create the test files with specific permissions
+    for (path, mode) in &test_files {
+        let file_path = base_path.join(path);
+        File::create(&file_path)?;
+        fs::set_permissions(&file_path, fs::Permissions::from_mode(*mode))?;
+        
+        // Debug: Print actual permissions
+        let metadata = fs::metadata(&file_path)?;
+        println!("File: {} (mode: {:o})", path, metadata.mode() & 0o7777);
+    }
+
+    // Permission-based test cases
+    let perm_test_cases = vec![
+        TestCase {
+            pattern: "*.txt",
+            expected_counts: vec![
+                ("exec.txt", 1),
+                ("all_exec.txt", 1),
+                ("no_write.txt", 1),
+                ("setuid.txt", 1),
+                ("setgid.txt", 1),
+                ("sticky.txt", 1),
+                ("no_read.txt", 1),
+            ],
+            max_depth: None,
+            threads: Some(1),
+            type_filter: Some("f"),
+            symlink_mode: None,
+            description: "Find files with user execute permission",
+            base_path_override: Some("perm_test"),
+            perm: Some("u+x"),
+            uid: None,
+            gid: None,
+            mtime: None,
+            atime: None,
+            ctime: None,
+            size: None,
+        },
+        TestCase {
+            pattern: "*.txt",
+            expected_counts: vec![
+                ("no_exec.txt", 1),
+            ],
+            max_depth: None,
+            threads: Some(1),
+            type_filter: Some("f"),
+            symlink_mode: None,
+            description: "Find files without group execute permission",
+            base_path_override: Some("perm_test"),
+            perm: Some("g-x"),
+            uid: None,
+            gid: None,
+            mtime: None,
+            atime: None,
+            ctime: None,
+            size: None,
+        },
+        TestCase {
+            pattern: "*.txt",
+            expected_counts: vec![
+                ("group_write.txt", 1),
+                ("all_exec.txt", 1),
+                ("no_read.txt", 1),
+            ],
+            max_depth: None,
+            threads: Some(1),
+            type_filter: Some("f"),
+            symlink_mode: None,
+            description: "Find files with group write permission",
+            base_path_override: Some("perm_test"),
+            perm: Some("g+w"),
+            uid: None,
+            gid: None,
+            mtime: None,
+            atime: None,
+            ctime: None,
+            size: None,
+        },
+        TestCase {
+            pattern: "*.txt",
+            expected_counts: vec![
+                ("no_read.txt", 1),
+            ],
+            max_depth: None,
+            threads: Some(1),
+            type_filter: Some("f"),
+            symlink_mode: None,
+            description: "Find files without read permission for others",
+            base_path_override: Some("perm_test"),
+            perm: Some("o-r"),
+            uid: None,
+            gid: None,
+            mtime: None,
+            atime: None,
+            ctime: None,
+            size: None,
+        },
+        TestCase {
+            pattern: "*.txt",
+            expected_counts: vec![
+                ("all_exec.txt", 1),
+                ("no_read.txt", 1),
+            ],
+            max_depth: None,
+            threads: Some(1),
+            type_filter: Some("f"),
+            symlink_mode: None,
+            description: "Find files with write permission for all",
+            base_path_override: Some("perm_test"),
+            perm: Some("a+w"),
+            uid: None,
+            gid: None,
+            mtime: None,
+            atime: None,
+            ctime: None,
+            size: None,
+        },
+        // Test for setuid bit
+        TestCase {
+            pattern: "setuid.txt",
+            expected_counts: vec![
+                ("setuid.txt", 1),
+            ],
+            max_depth: None,
+            threads: Some(1),
+            type_filter: Some("f"),
+            symlink_mode: None,
+            description: "Find file with setuid bit",
+            base_path_override: Some("perm_test"),
+            perm: Some("u+s"),
+            uid: None,
+            gid: None,
+            mtime: None,
+            atime: None,
+            ctime: None,
+            size: None,
+        },
+        // Test for setgid bit
+        TestCase {
+            pattern: "setgid.txt",
+            expected_counts: vec![
+                ("setgid.txt", 1),
+            ],
+            max_depth: None,
+            threads: Some(1),
+            type_filter: Some("f"),
+            symlink_mode: None,
+            description: "Find file with setgid bit",
+            base_path_override: Some("perm_test"),
+            perm: Some("g+s"),
+            uid: None,
+            gid: None,
+            mtime: None,
+            atime: None,
+            ctime: None,
+            size: None,
+        },
+    ];
+
+    // Path to our compiled test binary
+    let mut bin_path = env::current_exe()?;
+    bin_path.pop(); // remove test binary name
+    bin_path.pop(); // remove "deps"
+    bin_path.push("rfind");
+
+    // Execute each test case
+    for test_case in perm_test_cases {
+        println!("\nRunning permission filter test case: {}", test_case.description);
+        println!("Pattern: {}", test_case.pattern);
+
+        // Build command
+        let mut cmd = Command::new(&bin_path);
+        
+        let base_dir = if let Some(rel_path) = test_case.base_path_override {
+            base_path.join(rel_path)
+        } else {
+            base_path.to_path_buf()
+        };
+
+        // Basic arguments
+        cmd.arg(test_case.pattern)
+            .arg("--dir")
+            .arg(&base_dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        // Optional arguments
+        if let Some(depth) = test_case.max_depth {
+            cmd.arg("--max-depth").arg(depth.to_string());
+        }
+        if let Some(threads) = test_case.threads {
+            cmd.arg("--threads").arg(threads.to_string());
+        }
+        if let Some(tfilter) = test_case.type_filter {
+            cmd.arg("--type").arg(tfilter);
+        }
+        if let Some(symlink_flag) = test_case.symlink_mode {
+            cmd.arg(symlink_flag);
+        }
+        if let Some(perm) = test_case.perm {
+            cmd.arg("--perm").arg(perm);
+            println!("  With permission filter: {}", perm);
+        }
+        if let Some(uid) = test_case.uid {
+            cmd.arg("--uid").arg(uid);
+        }
+        if let Some(gid) = test_case.gid {
+            cmd.arg("--gid").arg(gid);
+        }
+
+        // Run command and collect results
+        let mut child = cmd.spawn()?;
+        let mut found_counts: HashMap<String, usize> = HashMap::new();
+
+        if let Some(stdout) = child.stdout.take() {
+            let reader = BufReader::new(stdout);
+            for line_result in reader.lines() {
+                let line = line_result?;
+                if let Some(file_name) = Path::new(line.trim()).file_name().and_then(|n| n.to_str()) {
+                    *found_counts.entry(file_name.to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+
+        // Check process status
+        let status = child.wait()?;
+        if !status.success() {
+            let mut error_message = String::new();
+            if let Some(mut stderr) = child.stderr.take() {
+                std::io::Read::read_to_string(&mut stderr, &mut error_message)?;
+            }
+            return Err(format!(
+                "Process failed in test '{}' with status: {}. Stderr: {}",
+                test_case.description, status, error_message
+            ).into());
+        }
+
+        // Verify results
+        let expected_map = make_expected_map(&test_case.expected_counts);
+        println!("  Expected counts: {:?}", expected_map);
+        println!("  Found counts:    {:?}", found_counts);
+
+        // Check for expected files
+        for (expected_file, &expected_count) in &expected_map {
+            let actual_count = found_counts.get(expected_file).copied().unwrap_or(0);
+            assert_eq!(
+                actual_count, expected_count,
+                "Test '{}': Mismatch for file '{}' - expected {} occurrences, found {}",
+                test_case.description, expected_file, expected_count, actual_count
+            );
+        }
+
+        // Check for unexpected files
+        for (found_file, &count) in &found_counts {
+            if !expected_map.contains_key(found_file.as_str()) && count > 0 {
+                return Err(format!(
+                    "Test '{}': Found unexpected file '{}' with count {}",
+                    test_case.description, found_file, count
+                ).into());
+            }
+        }
+
+        println!("  ✓ Test passed: {}", test_case.description);
     }
 
     Ok(())
