@@ -5,12 +5,6 @@ use std::os::unix::fs::MetadataExt;
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
 
-#[cfg(windows)]
-use windows_acl::{
-    acl::ACL,
-    helper::{get_current_groups, get_current_user},
-};
-
 /// Represents permission filter mode
 #[derive(Debug, Clone, Copy)]
 pub enum PermissionMode {
