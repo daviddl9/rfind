@@ -5,6 +5,12 @@ use std::os::unix::fs::MetadataExt;
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
 
+#[cfg(windows)]
+use windows_acl::{
+    acl::ACL,
+    helper::{get_current_groups, get_current_user},
+};
+
 /// Represents permission filter mode
 #[derive(Debug, Clone, Copy)]
 pub enum PermissionMode {
@@ -101,21 +107,72 @@ impl PermissionFilter {
 
         #[cfg(windows)]
         {
-            // Windows has a different permission model - we'll map some basic concepts
-            let readonly = metadata.file_attributes() & 0x1 != 0;
-
             let result = match self.perm_type {
-                PermissionType::Read => !readonly,
-                PermissionType::Write => !readonly,
-                PermissionType::Execute => {
-                    // Check file extension for .exe, .bat, .cmd
-                    if let Some(ext) = metadata.file_name().and_then(|n| n.to_str()) {
-                        ext.ends_with(".exe") || ext.ends_with(".bat") || ext.ends_with(".cmd")
-                    } else {
-                        false
-                    }
+                PermissionType::Read | PermissionType::Write | PermissionType::Execute => {
+                    // Get the ACL for the file
+                    let acl = match ACL::from_file_path(path) {
+                        Ok(acl) => acl,
+                        Err(_) => return false,
+                    };
+
+                    // Get current user and groups
+                    let current_user = match get_current_user() {
+                        Ok(user) => user,
+                        Err(_) => return false,
+                    };
+
+                    let current_groups = match get_current_groups() {
+                        Ok(groups) => groups,
+                        Err(_) => return false,
+                    };
+
+                    // Check effective permissions based on ACL
+                    let has_permission = match self.perm_type {
+                        PermissionType::Read => {
+                            acl.check_access_for_sid(&current_user, true, false, false)
+                                .unwrap_or(false)
+                                || current_groups.iter().any(|group| {
+                                    acl.check_access_for_sid(group, true, false, false)
+                                        .unwrap_or(false)
+                                })
+                        }
+                        PermissionType::Write => {
+                            acl.check_access_for_sid(&current_user, false, true, false)
+                                .unwrap_or(false)
+                                || current_groups.iter().any(|group| {
+                                    acl.check_access_for_sid(group, false, true, false)
+                                        .unwrap_or(false)
+                                })
+                        }
+                        PermissionType::Execute => {
+                            // For execute, check both execute permission and file extension
+                            let has_execute_perm = acl
+                                .check_access_for_sid(&current_user, false, false, true)
+                                .unwrap_or(false)
+                                || current_groups.iter().any(|group| {
+                                    acl.check_access_for_sid(group, false, false, true)
+                                        .unwrap_or(false)
+                                });
+
+                            // Also check if the file has an executable extension
+                            let is_executable_ext = path
+                                .extension()
+                                .and_then(|ext| ext.to_str())
+                                .map(|ext| {
+                                    ext.eq_ignore_ascii_case("exe")
+                                        || ext.eq_ignore_ascii_case("bat")
+                                        || ext.eq_ignore_ascii_case("cmd")
+                                })
+                                .unwrap_or(false);
+
+                            has_execute_perm && is_executable_ext
+                        }
+                        _ => false,
+                    };
+
+                    has_permission
                 }
-                PermissionType::SetID => false, // Windows doesn't have setuid/setgid
+                PermissionType::SetID => false, // Windows doesn't support SetID
             };
 
             result == self.expected
