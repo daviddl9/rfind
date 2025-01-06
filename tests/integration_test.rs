@@ -9,7 +9,10 @@ use filetime::*;
 use std::time::{SystemTime, Duration};
 use rfind::permissions::{PermissionFilter, PermissionMode, PermissionType, SpecialMode, has_special_mode};
 use std::fs::File;
+#[cfg(unix)]
 use std::os::unix::fs::{PermissionsExt, MetadataExt};
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 use tempfile::tempdir;
 
 /// Represents a single integration test configuration
@@ -318,6 +321,7 @@ fn test_permission_filter_parsing() {
     assert!(PermissionFilter::parse("invalid").is_err());
 }
 
+#[cfg(unix)]
 #[test]
 fn test_permission_matching() {
     let dir = tempdir().unwrap();
@@ -336,6 +340,7 @@ fn test_permission_matching() {
     assert!(filter.matches(&metadata));
 }
 
+#[cfg(unix)]
 #[test]
 fn test_special_modes() {
     let dir = tempdir().unwrap();
@@ -1059,6 +1064,29 @@ fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn set_file_permissions(file_path: &Path, mode: u32) -> std::io::Result<()> {
+    fs::set_permissions(file_path, fs::Permissions::from_mode(mode))
+}
+
+#[cfg(windows)]
+fn set_file_permissions(_file_path: &Path, _mode: u32) -> std::io::Result<()> {
+    // On Windows, just succeed without doing anything
+    Ok(())
+}
+
+// Let's modify the permission test functions
+#[cfg(unix)]
+fn print_file_mode(path: &str, metadata: &fs::Metadata) {
+    println!("File: {} (mode: {:o})", path, metadata.mode() & 0o7777);
+}
+
+#[cfg(windows)]
+fn print_file_mode(path: &str, metadata: &fs::Metadata) {
+    println!("File: {} (attributes: {:x})", path, metadata.file_attributes());
+}
+
+#[cfg(unix)]
 #[test]
 fn test_file_finder_permission_filters() -> Result<(), Box<dyn std::error::Error>> {
     // Create a temporary directory structure for testing
@@ -1085,11 +1113,11 @@ fn test_file_finder_permission_filters() -> Result<(), Box<dyn std::error::Error
     for (path, mode) in &test_files {
         let file_path = base_path.join(path);
         File::create(&file_path)?;
-        fs::set_permissions(&file_path, fs::Permissions::from_mode(*mode))?;
+        set_file_permissions(&file_path, *mode)?;
         
         // Debug: Print actual permissions
         let metadata = fs::metadata(&file_path)?;
-        println!("File: {} (mode: {:o})", path, metadata.mode() & 0o7777);
+        print_file_mode(path, &metadata);
     }
 
     // Permission-based test cases
@@ -1289,6 +1317,261 @@ fn test_file_finder_permission_filters() -> Result<(), Box<dyn std::error::Error
         }
         if let Some(gid) = test_case.gid {
             cmd.arg("--gid").arg(gid);
+        }
+
+        // Run command and collect results
+        let mut child = cmd.spawn()?;
+        let mut found_counts: HashMap<String, usize> = HashMap::new();
+
+        if let Some(stdout) = child.stdout.take() {
+            let reader = BufReader::new(stdout);
+            for line_result in reader.lines() {
+                let line = line_result?;
+                if let Some(file_name) = Path::new(line.trim()).file_name().and_then(|n| n.to_str()) {
+                    *found_counts.entry(file_name.to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+
+        // Check process status
+        let status = child.wait()?;
+        if !status.success() {
+            let mut error_message = String::new();
+            if let Some(mut stderr) = child.stderr.take() {
+                std::io::Read::read_to_string(&mut stderr, &mut error_message)?;
+            }
+            return Err(format!(
+                "Process failed in test '{}' with status: {}. Stderr: {}",
+                test_case.description, status, error_message
+            ).into());
+        }
+
+        // Verify results
+        let expected_map = make_expected_map(&test_case.expected_counts);
+        println!("  Expected counts: {:?}", expected_map);
+        println!("  Found counts:    {:?}", found_counts);
+
+        // Check for expected files
+        for (expected_file, &expected_count) in &expected_map {
+            let actual_count = found_counts.get(expected_file).copied().unwrap_or(0);
+            assert_eq!(
+                actual_count, expected_count,
+                "Test '{}': Mismatch for file '{}' - expected {} occurrences, found {}",
+                test_case.description, expected_file, expected_count, actual_count
+            );
+        }
+
+        // Check for unexpected files
+        for (found_file, &count) in &found_counts {
+            if !expected_map.contains_key(found_file.as_str()) && count > 0 {
+                return Err(format!(
+                    "Test '{}': Found unexpected file '{}' with count {}",
+                    test_case.description, found_file, count
+                ).into());
+            }
+        }
+
+        println!("  ✓ Test passed: {}", test_case.description);
+    }
+
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn test_file_finder_permission_filters() -> Result<(), Box<dyn std::error::Error>> {
+    // Create a temporary directory structure for testing
+    let temp_dir = TempDir::new()?;
+    let base_path = temp_dir.path();
+
+    // Create test directory
+    fs::create_dir_all(base_path.join("perm_test"))?;
+    
+    // Define test files with Windows attributes
+    // FILE_ATTRIBUTE reference:
+    // READONLY  = 0x1
+    // HIDDEN    = 0x2
+    // SYSTEM    = 0x4
+    // DIRECTORY = 0x10
+    // ARCHIVE   = 0x20
+    let test_files = vec![
+        ("perm_test/readonly.txt", |perms: &mut fs::Permissions| {
+            perms.set_readonly(true);
+        }),
+        ("perm_test/writable.txt", |_: &mut fs::Permissions| {
+            // Default permissions (writable)
+        }),
+        ("perm_test/hidden.txt", |perms: &mut fs::Permissions| {
+            // Note: We'll need to use Windows API to set hidden attribute
+            let path_str = std::env::current_dir()
+                .unwrap()
+                .join("perm_test/hidden.txt")
+                .to_str()
+                .unwrap()
+                .to_owned();
+            unsafe {
+                let wide: Vec<u16> = path_str.encode_utf16().chain(Some(0)).collect();
+                winapi::um::fileapi::SetFileAttributesW(
+                    wide.as_ptr(),
+                    winapi::um::winnt::FILE_ATTRIBUTE_HIDDEN,
+                );
+            }
+        }),
+        ("perm_test/system.txt", |perms: &mut fs::Permissions| {
+            let path_str = std::env::current_dir()
+                .unwrap()
+                .join("perm_test/system.txt")
+                .to_str()
+                .unwrap()
+                .to_owned();
+            unsafe {
+                let wide: Vec<u16> = path_str.encode_utf16().chain(Some(0)).collect();
+                winapi::um::fileapi::SetFileAttributesW(
+                    wide.as_ptr(),
+                    winapi::um::winnt::FILE_ATTRIBUTE_SYSTEM,
+                );
+            }
+        }),
+    ];
+
+    // Create the test files with specific attributes
+    for (path, set_attrs) in &test_files {
+        let file_path = base_path.join(path);
+        File::create(&file_path)?;
+        
+        // Apply the attributes
+        let mut perms = fs::metadata(&file_path)?.permissions();
+        set_attrs(&mut perms);
+        set_file_permissions(&file_path, perms)?;
+        
+        // Debug: Print actual attributes
+        let metadata = fs::metadata(&file_path)?;
+        println!("File: {} (attributes: 0x{:x})", path, metadata.file_attributes());
+    }
+
+    // Windows-specific test cases that map Unix-style permission tests to Windows attributes
+    let perm_test_cases = vec![
+        TestCase {
+            pattern: "*.txt",
+            expected_counts: vec![
+                ("readonly.txt", 1),
+            ],
+            max_depth: None,
+            threads: Some(1),
+            type_filter: Some("f"),
+            symlink_mode: None,
+            description: "Find readonly files (maps to u-w)",
+            base_path_override: Some("perm_test"),
+            perm: Some("u-w"),
+            uid: None,
+            gid: None,
+            mtime: None,
+            atime: None,
+            ctime: None,
+            size: None,
+        },
+        TestCase {
+            pattern: "*.txt",
+            expected_counts: vec![
+                ("writable.txt", 1),
+            ],
+            max_depth: None,
+            threads: Some(1),
+            type_filter: Some("f"),
+            symlink_mode: None,
+            description: "Find writable files (maps to u+w)",
+            base_path_override: Some("perm_test"),
+            perm: Some("u+w"),
+            uid: None,
+            gid: None,
+            mtime: None,
+            atime: None,
+            ctime: None,
+            size: None,
+        },
+        TestCase {
+            pattern: "*.txt",
+            expected_counts: vec![
+                ("hidden.txt", 1),
+            ],
+            max_depth: None,
+            threads: Some(1),
+            type_filter: Some("f"),
+            symlink_mode: None,
+            description: "Find hidden files",
+            base_path_override: Some("perm_test"),
+            perm: Some("o-r"), // Map "no read for others" to hidden files
+            uid: None,
+            gid: None,
+            mtime: None,
+            atime: None,
+            ctime: None,
+            size: None,
+        },
+        TestCase {
+            pattern: "*.txt",
+            expected_counts: vec![
+                ("system.txt", 1),
+            ],
+            max_depth: None,
+            threads: Some(1),
+            type_filter: Some("f"),
+            symlink_mode: None,
+            description: "Find system files",
+            base_path_override: Some("perm_test"),
+            perm: Some("g-w"), // Map "no write for group" to system files
+            uid: None,
+            gid: None,
+            mtime: None,
+            atime: None,
+            ctime: None,
+            size: None,
+        },
+    ];
+
+    // Path to our compiled test binary
+    let mut bin_path = env::current_exe()?;
+    bin_path.pop(); // remove test binary name
+    bin_path.pop(); // remove "deps"
+    bin_path.push("rfind");
+
+    // Execute each test case
+    for test_case in perm_test_cases {
+        println!("\nRunning permission filter test case: {}", test_case.description);
+        println!("Pattern: {}", test_case.pattern);
+
+        // Build command
+        let mut cmd = Command::new(&bin_path);
+        
+        let base_dir = if let Some(rel_path) = test_case.base_path_override {
+            base_path.join(rel_path)
+        } else {
+            base_path.to_path_buf()
+        };
+
+        // Basic arguments
+        cmd.arg(test_case.pattern)
+            .arg("--dir")
+            .arg(&base_dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        // Optional arguments
+        if let Some(depth) = test_case.max_depth {
+            cmd.arg("--max-depth").arg(depth.to_string());
+        }
+        if let Some(threads) = test_case.threads {
+            cmd.arg("--threads").arg(threads.to_string());
+        }
+        if let Some(tfilter) = test_case.type_filter {
+            cmd.arg("--type").arg(tfilter);
+        }
+        if let Some(symlink_flag) = test_case.symlink_mode {
+            cmd.arg(symlink_flag);
+        }
+        if let Some(perm) = test_case.perm {
+            cmd.arg("--perm").arg(perm);
+            println!("  With permission filter: {}", perm);
         }
 
         // Run command and collect results
