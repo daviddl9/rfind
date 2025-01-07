@@ -26,32 +26,6 @@ enum SymlinkMode {
     Always,  // -L: Follow all symlinks
 }
 
-/// Enum to filter results by type.
-#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
-enum TypeFilter {
-    #[default]
-    Any,
-    File,
-    Dir,
-    Symlink,
-}
-
-impl std::str::FromStr for TypeFilter {
-    type Err = String;
-
-    /// Converts user input to a `TypeFilter`.
-    /// Example: "-t f" => `TypeFilter::File`, "-t d" => `TypeFilter::Dir`, "-t l" => `TypeFilter::Symlink`.
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "f" | "file" => Ok(TypeFilter::File),
-            "d" | "dir" => Ok(TypeFilter::Dir),
-            "l" | "link" | "symlink" => Ok(TypeFilter::Symlink),
-            "any" => Ok(TypeFilter::Any),
-            other => Err(format!("Invalid type filter '{}'. Use f|d|l|any.", other)),
-        }
-    }
-}
-
 enum PatternMatcher {
     Glob(Pattern),
     Substring { pattern_bytes: Box<[u8]> },
@@ -118,7 +92,7 @@ struct Args {
     /// Filter the results by type.
     /// Possible values: f|file, d|dir, l|symlink, or any.
     #[arg(short = 't', long = "type", default_value = "any")]
-    type_filter: TypeFilter,
+    type_filter: filters::TypeFilter,
 
     /// Print each matching path followed by a null character ('\0')
     /// instead of a newline, similar to "find -print0".
@@ -163,7 +137,7 @@ struct ScannerContext {
     is_command_line: bool,                       // True for initial directory
     visited_paths: Arc<Mutex<HashSet<PathBuf>>>, // For loop detection
     root_path: PathBuf,
-    type_filter: TypeFilter,
+    type_filter: filters::TypeFilter,
     mtime_filter: Option<filters::TimeFilter>,
     atime_filter: Option<filters::TimeFilter>,
     ctime_filter: Option<filters::TimeFilter>,
@@ -215,13 +189,17 @@ fn should_follow_symlink(ctx: &ScannerContext, is_command_path: bool) -> bool {
 
 /// Checks if the file/directory/symlink should be recorded as a match
 /// based on the --type / -t filter provided by the user.
-fn is_type_match(metadata: &std::fs::Metadata, filter: TypeFilter, ctx: &ScannerContext) -> bool {
+fn is_type_match(
+    metadata: &std::fs::Metadata,
+    filter: filters::TypeFilter,
+    ctx: &ScannerContext,
+) -> bool {
     let file_type = metadata.file_type();
     let base_match = match filter {
-        TypeFilter::Any => true,
-        TypeFilter::File => file_type.is_file(),
-        TypeFilter::Dir => file_type.is_dir(),
-        TypeFilter::Symlink => file_type.is_symlink(),
+        filters::TypeFilter::Any => true,
+        filters::TypeFilter::File => file_type.is_file(),
+        filters::TypeFilter::Dir => file_type.is_dir(),
+        filters::TypeFilter::Symlink => file_type.is_symlink(),
     };
 
     if !base_match {
@@ -364,7 +342,7 @@ struct ScannerConfig {
     max_depth: usize,
     symlink_mode: SymlinkMode,
     root_path: PathBuf,
-    type_filter: TypeFilter,
+    type_filter: filters::TypeFilter,
     mtime_filter: Option<filters::TimeFilter>,
     atime_filter: Option<filters::TimeFilter>,
     ctime_filter: Option<filters::TimeFilter>,
@@ -499,7 +477,7 @@ struct ThreadPoolOptions {
     max_depth: usize,
     symlink_mode: SymlinkMode,
     root_path: PathBuf,
-    type_filter: TypeFilter,
+    type_filter: filters::TypeFilter,
     mtime_filter: Option<filters::TimeFilter>,
     atime_filter: Option<filters::TimeFilter>,
     ctime_filter: Option<filters::TimeFilter>,
