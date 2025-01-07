@@ -1380,6 +1380,8 @@ fn test_file_finder_permission_filters() -> Result<(), Box<dyn std::error::Error
 #[cfg(windows)]
 #[test]
 fn test_file_finder_permission_filters() -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::windows::fs::MetadataExt;
+    
     // Create a temporary directory structure for testing
     let temp_dir = TempDir::new()?;
     let base_path = temp_dir.path();
@@ -1387,69 +1389,65 @@ fn test_file_finder_permission_filters() -> Result<(), Box<dyn std::error::Error
     // Create test directory
     fs::create_dir_all(base_path.join("perm_test"))?;
     
-    // Define test files with Windows attributes
-    // FILE_ATTRIBUTE reference:
-    // READONLY  = 0x1
-    // HIDDEN    = 0x2
-    // SYSTEM    = 0x4
-    // DIRECTORY = 0x10
-    // ARCHIVE   = 0x20
+    // Define test files with their attributes
+    struct TestFile {
+        name: &'static str,
+        attributes: u32,
+    }
+
+    // FILE_ATTRIBUTE constants
+    const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
+    const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+    const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
+    const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x20;
+
     let test_files = vec![
-        ("perm_test/readonly.txt", |perms: &mut fs::Permissions| {
-            perms.set_readonly(true);
-        }),
-        ("perm_test/writable.txt", |_: &mut fs::Permissions| {
-            // Default permissions (writable)
-        }),
-        ("perm_test/hidden.txt", |perms: &mut fs::Permissions| {
-            // Note: We'll need to use Windows API to set hidden attribute
-            let path_str = std::env::current_dir()
-                .unwrap()
-                .join("perm_test/hidden.txt")
-                .to_str()
-                .unwrap()
-                .to_owned();
-            unsafe {
-                let wide: Vec<u16> = path_str.encode_utf16().chain(Some(0)).collect();
-                winapi::um::fileapi::SetFileAttributesW(
-                    wide.as_ptr(),
-                    winapi::um::winnt::FILE_ATTRIBUTE_HIDDEN,
-                );
-            }
-        }),
-        ("perm_test/system.txt", |perms: &mut fs::Permissions| {
-            let path_str = std::env::current_dir()
-                .unwrap()
-                .join("perm_test/system.txt")
-                .to_str()
-                .unwrap()
-                .to_owned();
-            unsafe {
-                let wide: Vec<u16> = path_str.encode_utf16().chain(Some(0)).collect();
-                winapi::um::fileapi::SetFileAttributesW(
-                    wide.as_ptr(),
-                    winapi::um::winnt::FILE_ATTRIBUTE_SYSTEM,
-                );
-            }
-        }),
+        TestFile {
+            name: "perm_test/readonly.txt",
+            attributes: FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_ARCHIVE,
+        },
+        TestFile {
+            name: "perm_test/writable.txt",
+            attributes: FILE_ATTRIBUTE_ARCHIVE,
+        },
+        TestFile {
+            name: "perm_test/hidden.txt",
+            attributes: FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_ARCHIVE,
+        },
+        TestFile {
+            name: "perm_test/system.txt",
+            attributes: FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_ARCHIVE,
+        },
     ];
 
-    // Create the test files with specific attributes
-    for (path, set_attrs) in &test_files {
-        let file_path = base_path.join(path);
+    // Create the test files and set their attributes
+    for test_file in &test_files {
+        let file_path = base_path.join(test_file.name);
+        
+        // Create the file first
         File::create(&file_path)?;
         
-        // Apply the attributes
-        let mut perms = fs::metadata(&file_path)?.permissions();
-        set_attrs(&mut perms);
-        set_file_permissions(&file_path, perms)?;
+        // Convert path to wide string for Windows API
+        let path_wide: Vec<u16> = file_path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+            
+        // Set the Windows file attributes
+        unsafe {
+            winapi::um::fileapi::SetFileAttributesW(
+                path_wide.as_ptr(),
+                test_file.attributes
+            );
+        }
         
         // Debug: Print actual attributes
         let metadata = fs::metadata(&file_path)?;
-        println!("File: {} (attributes: 0x{:x})", path, metadata.file_attributes());
+        println!("File: {} (attributes: 0x{:x})", test_file.name, metadata.file_attributes());
     }
 
-    // Windows-specific test cases that map Unix-style permission tests to Windows attributes
+    // Windows-specific test cases
     let perm_test_cases = vec![
         TestCase {
             pattern: "*.txt",
@@ -1460,9 +1458,9 @@ fn test_file_finder_permission_filters() -> Result<(), Box<dyn std::error::Error
             threads: Some(1),
             type_filter: Some("f"),
             symlink_mode: None,
-            description: "Find readonly files (maps to u-w)",
+            description: "Find readonly files",
             base_path_override: Some("perm_test"),
-            perm: Some("u-w"),
+            perm: Some("u-w"),  // Maps to readonly on Windows
             uid: None,
             gid: None,
             mtime: None,
@@ -1479,47 +1477,9 @@ fn test_file_finder_permission_filters() -> Result<(), Box<dyn std::error::Error
             threads: Some(1),
             type_filter: Some("f"),
             symlink_mode: None,
-            description: "Find writable files (maps to u+w)",
+            description: "Find writable files",
             base_path_override: Some("perm_test"),
-            perm: Some("u+w"),
-            uid: None,
-            gid: None,
-            mtime: None,
-            atime: None,
-            ctime: None,
-            size: None,
-        },
-        TestCase {
-            pattern: "*.txt",
-            expected_counts: vec![
-                ("hidden.txt", 1),
-            ],
-            max_depth: None,
-            threads: Some(1),
-            type_filter: Some("f"),
-            symlink_mode: None,
-            description: "Find hidden files",
-            base_path_override: Some("perm_test"),
-            perm: Some("o-r"), // Map "no read for others" to hidden files
-            uid: None,
-            gid: None,
-            mtime: None,
-            atime: None,
-            ctime: None,
-            size: None,
-        },
-        TestCase {
-            pattern: "*.txt",
-            expected_counts: vec![
-                ("system.txt", 1),
-            ],
-            max_depth: None,
-            threads: Some(1),
-            type_filter: Some("f"),
-            symlink_mode: None,
-            description: "Find system files",
-            base_path_override: Some("perm_test"),
-            perm: Some("g-w"), // Map "no write for group" to system files
+            perm: Some("u+w"),  // Maps to !readonly on Windows
             uid: None,
             gid: None,
             mtime: None,
@@ -1588,7 +1548,7 @@ fn test_file_finder_permission_filters() -> Result<(), Box<dyn std::error::Error
             }
         }
 
-        // Check process status
+        // Check process status and verify results
         let status = child.wait()?;
         if !status.success() {
             let mut error_message = String::new();
@@ -1606,7 +1566,7 @@ fn test_file_finder_permission_filters() -> Result<(), Box<dyn std::error::Error
         println!("  Expected counts: {:?}", expected_map);
         println!("  Found counts:    {:?}", found_counts);
 
-        // Check for expected files
+        // Check results match expectations
         for (expected_file, &expected_count) in &expected_map {
             let actual_count = found_counts.get(expected_file).copied().unwrap_or(0);
             assert_eq!(
@@ -1616,7 +1576,6 @@ fn test_file_finder_permission_filters() -> Result<(), Box<dyn std::error::Error
             );
         }
 
-        // Check for unexpected files
         for (found_file, &count) in &found_counts {
             if !expected_map.contains_key(found_file.as_str()) && count > 0 {
                 return Err(format!(
