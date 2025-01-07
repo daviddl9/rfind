@@ -13,6 +13,8 @@ use std::fs::File;
 use std::os::unix::fs::{PermissionsExt, MetadataExt};
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
 use tempfile::tempdir;
 
 /// Represents a single integration test configuration
