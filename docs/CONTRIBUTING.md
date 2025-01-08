@@ -27,17 +27,6 @@
 * Run `cargo clippy` and address warnings
 * Ensure all tests pass with `cargo test`
 
-### Commits
-
-* Use semantic commit messages:
-  * feat: (new feature)
-  * fix: (bug fix)
-  * docs: (documentation changes)
-  * style: (formatting, missing semicolons, etc)
-  * refactor: (code changes that neither fix bugs nor add features)
-  * test: (adding missing tests)
-  * chore: (updating grunt tasks etc)
-
 ### Testing
 
 * Write tests for new features
