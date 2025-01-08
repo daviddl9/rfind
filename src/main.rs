@@ -16,95 +16,7 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, SystemTime};
 use std::{collections::HashSet, path::PathBuf};
-
-/// Represents a time comparison operation
-#[derive(Debug, Clone, Copy)]
-enum TimeComparison {
-    Exactly, // n
-    Lesser,  // -n
-    Greater, // +n
-}
-
-/// Represents a time unit for comparison
-#[derive(Debug, Clone, Copy)]
-enum TimeUnit {
-    Seconds,
-    Minutes,
-    Hours,
-    Days,
-}
-
-/// Holds time-based filter configuration
-#[derive(Debug, Clone)]
-struct TimeFilter {
-    comparison: TimeComparison,
-    value: i64,
-    unit: TimeUnit,
-}
-
-impl TimeFilter {
-    /// Parse a time filter string in the format: [+-]N[smhd]
-    /// Examples: "+1h" (more than 1 hour), "-2m" (less than 2 minutes), "3d" (about 3 days back)
-    fn parse(s: &str) -> Result<Self, String> {
-        let (comparison, rest) = match s.chars().next() {
-            Some('+') => (TimeComparison::Greater, &s[1..]),
-            Some('-') => (TimeComparison::Lesser, &s[1..]),
-            Some(_) => (TimeComparison::Exactly, s),
-            None => return Err("Empty time filter".to_string()),
-        };
-
-        let unit = match rest.chars().last() {
-            Some('s') => TimeUnit::Seconds,
-            Some('m') => TimeUnit::Minutes,
-            Some('d') => TimeUnit::Days,
-            Some('h') => TimeUnit::Hours,
-            _ => return Err("Invalid time unit. Use 'm' for minutes or 'd' for days".to_string()),
-        };
-
-        let value_str = &rest[..rest.len() - 1];
-        let value = value_str
-            .parse::<i64>()
-            .map_err(|_| "Invalid number in time filter".to_string())?;
-
-        Ok(TimeFilter {
-            comparison,
-            value,
-            unit,
-        })
-    }
-
-    /// Convert the time filter value to a Duration
-    fn to_duration(&self) -> Duration {
-        match self.unit {
-            TimeUnit::Seconds => Duration::from_secs(self.value.unsigned_abs()),
-            TimeUnit::Minutes => Duration::from_secs(self.value.unsigned_abs() * 60),
-            TimeUnit::Hours => Duration::from_secs(self.value.unsigned_abs() * 60 * 60),
-            TimeUnit::Days => Duration::from_secs(self.value.unsigned_abs() * 24 * 60 * 60),
-        }
-    }
-
-    /// Check if a file's modification time matches the filter
-    fn matches(&self, file_time: SystemTime, now: SystemTime) -> bool {
-        let duration = self.to_duration();
-        let age = now.duration_since(file_time).unwrap_or(Duration::ZERO);
-
-        match self.comparison {
-            TimeComparison::Exactly => {
-                let tolerance = match self.unit {
-                    TimeUnit::Seconds => Duration::from_secs(2), // ±2 second
-                    TimeUnit::Minutes => Duration::from_secs(30), // ±30 seconds
-                    TimeUnit::Hours => Duration::from_secs(60 * 30), // ±30 minutes
-                    TimeUnit::Days => Duration::from_secs(60 * 60 * 12), // ±12 hours
-                };
-                let lower = duration.saturating_sub(tolerance);
-                let upper = duration.saturating_add(tolerance);
-                age >= lower && age <= upper
-            }
-            TimeComparison::Lesser => age < duration,
-            TimeComparison::Greater => age > duration,
-        }
-    }
-}
+mod filters;
 
 #[derive(Default, Debug, Clone, Copy)]
 enum SymlinkMode {
@@ -112,126 +24,6 @@ enum SymlinkMode {
     Never, // -P: Never follow symlinks
     Command, // -H: Follow symlinks on command line only
     Always,  // -L: Follow all symlinks
-}
-
-/// Represents a size comparison operation
-#[derive(Debug, Clone, Copy)]
-enum SizeComparison {
-    Exactly, // n
-    Lesser,  // -n
-    Greater, // +n
-}
-
-/// Represents a size unit for comparison
-#[derive(Debug, Clone, Copy)]
-enum SizeUnit {
-    Bytes,     // c
-    Kilobytes, // k
-    Megabytes, // M
-    Gigabytes, // G
-}
-
-/// Holds size-based filter configuration
-#[derive(Debug, Clone)]
-struct SizeFilter {
-    comparison: SizeComparison,
-    value: u64,
-    unit: SizeUnit,
-}
-
-impl SizeFilter {
-    /// Parse a size filter string in the format: [+-]N[ckmG]
-    /// Examples: "+1M" (more than 1 MiB), "-500k" (less than 500 KiB), "1G" (about 1 GiB)
-    fn parse(s: &str) -> Result<Self, String> {
-        let (comparison, rest) = match s.chars().next() {
-            Some('+') => (SizeComparison::Greater, &s[1..]),
-            Some('-') => (SizeComparison::Lesser, &s[1..]),
-            Some(_) => (SizeComparison::Exactly, s),
-            None => return Err("Empty size filter".to_string()),
-        };
-
-        let unit = match rest.chars().last() {
-            Some('c') => SizeUnit::Bytes,
-            Some('k') => SizeUnit::Kilobytes,
-            Some('M') => SizeUnit::Megabytes,
-            Some('G') => SizeUnit::Gigabytes,
-            _ => {
-                return Err(
-                    "Invalid size unit. Use c (bytes), k (KB), M (MB), or G (GB)".to_string(),
-                )
-            }
-        };
-
-        let value_str = &rest[..rest.len() - 1];
-        let value = value_str
-            .parse::<u64>()
-            .map_err(|_| "Invalid number in size filter".to_string())?;
-
-        Ok(SizeFilter {
-            comparison,
-            value,
-            unit,
-        })
-    }
-
-    /// Convert the size filter value to bytes
-    fn to_bytes(&self) -> u64 {
-        match self.unit {
-            SizeUnit::Bytes => self.value,
-            SizeUnit::Kilobytes => self.value * 1024,
-            SizeUnit::Megabytes => self.value * 1024 * 1024,
-            SizeUnit::Gigabytes => self.value * 1024 * 1024 * 1024,
-        }
-    }
-
-    /// Check if a file's size matches the filter
-    fn matches(&self, file_size: u64) -> bool {
-        let target_size = self.to_bytes();
-
-        match self.comparison {
-            SizeComparison::Exactly => {
-                // For exact matches, we'll allow a small tolerance based on the unit
-                let tolerance = match self.unit {
-                    SizeUnit::Bytes => 0,
-                    SizeUnit::Kilobytes => 512,         // ±0.5KB
-                    SizeUnit::Megabytes => 524_288,     // ±0.5MB
-                    SizeUnit::Gigabytes => 536_870_912, // ±0.5GB
-                };
-
-                let lower = target_size.saturating_sub(tolerance);
-                let upper = target_size.saturating_add(tolerance);
-                file_size >= lower && file_size <= upper
-            }
-            SizeComparison::Lesser => file_size < target_size,
-            SizeComparison::Greater => file_size > target_size,
-        }
-    }
-}
-
-/// Enum to filter results by type.
-#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
-enum TypeFilter {
-    #[default]
-    Any,
-    File,
-    Dir,
-    Symlink,
-}
-
-impl std::str::FromStr for TypeFilter {
-    type Err = String;
-
-    /// Converts user input to a `TypeFilter`.
-    /// Example: "-t f" => `TypeFilter::File`, "-t d" => `TypeFilter::Dir`, "-t l" => `TypeFilter::Symlink`.
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "f" | "file" => Ok(TypeFilter::File),
-            "d" | "dir" => Ok(TypeFilter::Dir),
-            "l" | "link" | "symlink" => Ok(TypeFilter::Symlink),
-            "any" => Ok(TypeFilter::Any),
-            other => Err(format!("Invalid type filter '{}'. Use f|d|l|any.", other)),
-        }
-    }
 }
 
 enum PatternMatcher {
@@ -300,7 +92,7 @@ struct Args {
     /// Filter the results by type.
     /// Possible values: f|file, d|dir, l|symlink, or any.
     #[arg(short = 't', long = "type", default_value = "any")]
-    type_filter: TypeFilter,
+    type_filter: filters::TypeFilter,
 
     /// Print each matching path followed by a null character ('\0')
     /// instead of a newline, similar to "find -print0".
@@ -345,12 +137,12 @@ struct ScannerContext {
     is_command_line: bool,                       // True for initial directory
     visited_paths: Arc<Mutex<HashSet<PathBuf>>>, // For loop detection
     root_path: PathBuf,
-    type_filter: TypeFilter,
-    mtime_filter: Option<TimeFilter>,
-    atime_filter: Option<TimeFilter>,
-    ctime_filter: Option<TimeFilter>,
+    type_filter: filters::TypeFilter,
+    mtime_filter: Option<filters::TimeFilter>,
+    atime_filter: Option<filters::TimeFilter>,
+    ctime_filter: Option<filters::TimeFilter>,
     now: SystemTime,
-    size_filter: Option<SizeFilter>,
+    size_filter: Option<filters::SizeFilter>,
 }
 
 fn normalize_path(path: &Path, root: &Path) -> PathBuf {
@@ -397,13 +189,17 @@ fn should_follow_symlink(ctx: &ScannerContext, is_command_path: bool) -> bool {
 
 /// Checks if the file/directory/symlink should be recorded as a match
 /// based on the --type / -t filter provided by the user.
-fn is_type_match(metadata: &std::fs::Metadata, filter: TypeFilter, ctx: &ScannerContext) -> bool {
+fn is_type_match(
+    metadata: &std::fs::Metadata,
+    filter: filters::TypeFilter,
+    ctx: &ScannerContext,
+) -> bool {
     let file_type = metadata.file_type();
     let base_match = match filter {
-        TypeFilter::Any => true,
-        TypeFilter::File => file_type.is_file(),
-        TypeFilter::Dir => file_type.is_dir(),
-        TypeFilter::Symlink => file_type.is_symlink(),
+        filters::TypeFilter::Any => true,
+        filters::TypeFilter::File => file_type.is_file(),
+        filters::TypeFilter::Dir => file_type.is_dir(),
+        filters::TypeFilter::Symlink => file_type.is_symlink(),
     };
 
     if !base_match {
@@ -546,12 +342,12 @@ struct ScannerConfig {
     max_depth: usize,
     symlink_mode: SymlinkMode,
     root_path: PathBuf,
-    type_filter: TypeFilter,
-    mtime_filter: Option<TimeFilter>,
-    atime_filter: Option<TimeFilter>,
-    ctime_filter: Option<TimeFilter>,
+    type_filter: filters::TypeFilter,
+    mtime_filter: Option<filters::TimeFilter>,
+    atime_filter: Option<filters::TimeFilter>,
+    ctime_filter: Option<filters::TimeFilter>,
     now: SystemTime,
-    size_filter: Option<SizeFilter>,
+    size_filter: Option<filters::SizeFilter>,
 }
 
 fn spawn_scanner_thread(config: ScannerConfig) -> thread::JoinHandle<()> {
@@ -681,12 +477,12 @@ struct ThreadPoolOptions {
     max_depth: usize,
     symlink_mode: SymlinkMode,
     root_path: PathBuf,
-    type_filter: TypeFilter,
-    mtime_filter: Option<TimeFilter>,
-    atime_filter: Option<TimeFilter>,
-    ctime_filter: Option<TimeFilter>,
+    type_filter: filters::TypeFilter,
+    mtime_filter: Option<filters::TimeFilter>,
+    atime_filter: Option<filters::TimeFilter>,
+    ctime_filter: Option<filters::TimeFilter>,
     now: SystemTime,
-    size_filter: Option<SizeFilter>,
+    size_filter: Option<filters::SizeFilter>,
 }
 
 fn setup_thread_pool(pool_options: ThreadPoolOptions) -> ThreadPool {
@@ -735,7 +531,7 @@ fn main() {
     let mtime_filter = args
         .mtime
         .as_deref()
-        .map(TimeFilter::parse)
+        .map(filters::TimeFilter::parse)
         .transpose()
         .unwrap_or_else(|e| {
             eprintln!("Invalid mtime filter: {}", e);
@@ -745,7 +541,7 @@ fn main() {
     let atime_filter = args
         .atime
         .as_deref()
-        .map(TimeFilter::parse)
+        .map(filters::TimeFilter::parse)
         .transpose()
         .unwrap_or_else(|e| {
             eprintln!("Invalid atime filter: {}", e);
@@ -755,7 +551,7 @@ fn main() {
     let ctime_filter = args
         .ctime
         .as_deref()
-        .map(TimeFilter::parse)
+        .map(filters::TimeFilter::parse)
         .transpose()
         .unwrap_or_else(|e| {
             eprintln!("Invalid ctime filter: {}", e);
@@ -764,7 +560,7 @@ fn main() {
     let size_filter = args
         .size
         .as_deref()
-        .map(SizeFilter::parse)
+        .map(filters::SizeFilter::parse)
         .transpose()
         .unwrap_or_else(|e| {
             eprintln!("Invalid size filter: {}", e);
