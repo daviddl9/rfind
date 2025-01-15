@@ -143,6 +143,7 @@ struct ScannerContext {
     ctime_filter: Option<filters::TimeFilter>,
     now: SystemTime,
     size_filter: Option<filters::SizeFilter>,
+    system_checker: Arc<SystemPathChecker>,
 }
 
 fn normalize_path(path: &Path, root: &Path) -> PathBuf {
@@ -247,56 +248,6 @@ fn is_type_match(
     true
 }
 
-fn handle_entry(
-    entry: std::fs::DirEntry,
-    ctx: &ScannerContext,
-    channels: &ScannerChannels,
-) -> Result<(), Box<dyn Error>> {
-    let path = entry.path();
-    let metadata = entry.metadata()?;
-
-    // Normalize the path relative to root
-    let relative_path = normalize_path(&path, &ctx.root_path);
-
-    // Symlink handling
-    if metadata.file_type().is_symlink() {
-        if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-            if ctx.pattern.matches(file_name) && is_type_match(&metadata, ctx.type_filter, ctx) {
-                channels.result_tx.send(relative_path.clone())?;
-            }
-        }
-
-        match handle_symlink(&path, metadata.file_type(), ctx, channels) {
-            Ok(_) => (),
-            Err(e) => debug!("Error handling symlink {:?}: {}", path, e),
-        }
-        return Ok(());
-    }
-
-    // Directory
-    if metadata.file_type().is_dir() {
-        handle_directory(path.clone(), ctx.work.depth, ctx, channels)?;
-
-        if is_type_match(&metadata, ctx.type_filter, ctx) {
-            if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
-                if ctx.pattern.matches(dir_name) {
-                    channels.result_tx.send(relative_path)?;
-                }
-            }
-        }
-    }
-    // File
-    else if metadata.file_type().is_file() {
-        if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-            if ctx.pattern.matches(file_name) && is_type_match(&metadata, ctx.type_filter, ctx) {
-                channels.result_tx.send(relative_path)?;
-            }
-        }
-    }
-
-    Ok(())
-}
-
 fn handle_symlink(
     path: &Path,
     _file_type: std::fs::FileType,
@@ -348,6 +299,7 @@ struct ScannerConfig {
     ctime_filter: Option<filters::TimeFilter>,
     now: SystemTime,
     size_filter: Option<filters::SizeFilter>,
+    system_checker: Arc<SystemPathChecker>,
 }
 
 fn spawn_scanner_thread(config: ScannerConfig) -> thread::JoinHandle<()> {
@@ -380,6 +332,7 @@ fn spawn_scanner_thread(config: ScannerConfig) -> thread::JoinHandle<()> {
                 ctime_filter: config.ctime_filter.clone(),
                 now: config.now,
                 size_filter: config.size_filter.clone(),
+                system_checker: Arc::clone(&config.system_checker),
             };
 
             // More defensive read_dir handling
@@ -485,13 +438,133 @@ struct ThreadPoolOptions {
     size_filter: Option<filters::SizeFilter>,
 }
 
+#[derive(Default)]
+struct SystemPathChecker {
+    system_paths: Vec<PathBuf>,
+}
+
+impl SystemPathChecker {
+    fn new() -> Self {
+        let mut checker = SystemPathChecker::default();
+
+        #[cfg(target_os = "macos")]
+        {
+            checker.system_paths.extend_from_slice(&[
+                PathBuf::from("/System"),
+                PathBuf::from("/Library"),
+                PathBuf::from("/private"),
+                PathBuf::from("/Volumes"),
+            ]);
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            checker.system_paths.extend_from_slice(&[
+                PathBuf::from("/proc"),
+                PathBuf::from("/sys"),
+                PathBuf::from("/dev"),
+                PathBuf::from("/run"),
+                PathBuf::from("/private"),
+            ]);
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            checker.system_paths.extend_from_slice(&[
+                PathBuf::from("C:\\Windows"),
+                PathBuf::from("C:\\Program Files\\Windows"),
+                PathBuf::from("C:\\ProgramData\\Microsoft"),
+                PathBuf::from("C:\\System Volume Information"),
+            ]);
+        }
+
+        checker
+    }
+
+    #[inline]
+    fn is_system_path(&self, path: &Path) -> bool {
+        // Case-insensitive check for Windows paths
+        #[cfg(target_os = "windows")]
+        {
+            let path_str = path.to_string_lossy().to_lowercase();
+            self.system_paths.iter().any(|sys_path| {
+                path_str.starts_with(&sys_path.to_string_lossy().to_lowercase())
+                    || path_str.contains("\\system32")
+                    || path_str.contains("\\syswow64")
+            })
+        }
+
+        // Case-sensitive check for Unix-like systems
+        #[cfg(not(target_os = "windows"))]
+        {
+            self.system_paths
+                .iter()
+                .any(|sys_path| path.starts_with(sys_path))
+        }
+    }
+}
+
+// Update handle_entry function to use SystemPathChecker
+fn handle_entry(
+    entry: std::fs::DirEntry,
+    ctx: &ScannerContext,
+    channels: &ScannerChannels,
+) -> Result<(), Box<dyn Error>> {
+    let path = entry.path();
+
+    // Skip system paths early
+    if ctx.system_checker.is_system_path(&path) {
+        debug!("Skipping system path: {:?}", path);
+        return Ok(());
+    }
+
+    let metadata = entry.metadata()?;
+    let relative_path = normalize_path(&path, &ctx.root_path);
+
+    // Rest of the original handle_entry logic remains the same...
+    if metadata.file_type().is_symlink() {
+        if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+            if ctx.pattern.matches(file_name) && is_type_match(&metadata, ctx.type_filter, ctx) {
+                channels.result_tx.send(relative_path.clone())?;
+            }
+        }
+
+        match handle_symlink(&path, metadata.file_type(), ctx, channels) {
+            Ok(_) => (),
+            Err(e) => debug!("Error handling symlink {:?}: {}", path, e),
+        }
+        return Ok(());
+    }
+
+    if metadata.file_type().is_dir() {
+        handle_directory(path.clone(), ctx.work.depth, ctx, channels)?;
+
+        if is_type_match(&metadata, ctx.type_filter, ctx) {
+            if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
+                if ctx.pattern.matches(dir_name) {
+                    channels.result_tx.send(relative_path)?;
+                }
+            }
+        }
+    } else if metadata.file_type().is_file() {
+        if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+            if ctx.pattern.matches(file_name) && is_type_match(&metadata, ctx.type_filter, ctx) {
+                channels.result_tx.send(relative_path)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// Update setup_thread_pool to include SystemPathChecker
 fn setup_thread_pool(pool_options: ThreadPoolOptions) -> ThreadPool {
     let active_scanners = Arc::new(AtomicUsize::new(0));
+    let system_checker = Arc::new(SystemPathChecker::new());
     let mut scanner_handles = Vec::with_capacity(pool_options.thread_count);
 
-    // Spawn scanner threads
     for _ in 0..pool_options.thread_count {
-        let handle = spawn_scanner_thread(ScannerConfig {
+        let scanner_config = ScannerConfig {
             work_rx: pool_options.channels.work_rx.clone(),
             dir_tx: pool_options.channels.dir_tx.clone(),
             result_tx: pool_options.channels.result_tx.clone(),
@@ -506,20 +579,19 @@ fn setup_thread_pool(pool_options: ThreadPoolOptions) -> ThreadPool {
             ctime_filter: pool_options.ctime_filter.clone(),
             now: pool_options.now,
             size_filter: pool_options.size_filter.clone(),
-        });
-        scanner_handles.push(handle);
+            system_checker: Arc::clone(&system_checker),
+        };
+        scanner_handles.push(spawn_scanner_thread(scanner_config));
     }
 
-    // Spawn work distributor
-    let distributor_handle = spawn_work_distributor(
-        pool_options.channels.work_tx.clone(),
-        pool_options.channels.dir_rx,
-        Arc::clone(&active_scanners),
-    );
-
+    // Rest of the setup_thread_pool implementation remains the same...
     ThreadPool {
         scanner_handles,
-        distributor_handle,
+        distributor_handle: spawn_work_distributor(
+            pool_options.channels.work_tx,
+            pool_options.channels.dir_rx,
+            active_scanners,
+        ),
         result_receiver: pool_options.channels.result_rx,
     }
 }
