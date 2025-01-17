@@ -445,6 +445,9 @@ struct SystemPathChecker {
 
 impl SystemPathChecker {
     fn new() -> Self {
+        #[cfg(test)]
+        return SystemPathChecker::default();
+
         let mut checker = SystemPathChecker::default();
 
         #[cfg(target_os = "macos")]

@@ -43,7 +43,7 @@ struct TimeTestFile {
 #[test]
 fn test_file_finder_size_filters() -> Result<(), Box<dyn std::error::Error>> {
     // Create a temporary directory structure for testing
-    let temp_dir = TempDir::new()?;
+    let temp_dir = TempDir::new_in(".")?;
     let base_path = temp_dir.path();
 
     // Create test directory
@@ -286,7 +286,7 @@ fn test_file_finder_size_filters() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn test_file_finder_time_filters() -> Result<(), Box<dyn std::error::Error>> {
     // Create a temporary directory structure for testing
-    let temp_dir = TempDir::new()?;
+    let temp_dir = TempDir::new_in(".")?;
     let base_path = temp_dir.path();
 
     // Create test directories
@@ -586,7 +586,7 @@ fn create_symlink(target: impl AsRef<Path>, link: impl AsRef<Path>, _is_dir: boo
 #[test]
 fn test_file_finder_integration() -> Result<(), Box<dyn std::error::Error>> {
     // Create a temporary directory structure for testing
-    let temp_dir = TempDir::new()?;
+    let temp_dir = TempDir::new_in(".")?;
     let base_path = temp_dir.path();
 
     // Create directories
